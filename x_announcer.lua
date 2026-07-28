@@ -2558,10 +2558,11 @@ local function draw_settings_tab()
         end
         imgui.EndCombo()
     end
-    -- The hint used to be a tooltip on each entry.  FlyWithLua does not bind
-    -- imgui.SetTooltip at all, and calling it took the whole panel down the
-    -- moment this list was opened.  On the line it is anyway: a hint nobody has
-    -- to hover to find is the better one.
+    -- The hint used to be a tooltip on each entry, through imgui.SetTooltip -
+    -- which FlyWithLua does not bind, so it took the whole panel down the moment
+    -- this list was opened.  Hover hints are still possible the long way round
+    -- (imgui.BeginTooltip / EndTooltip, as FlyWithLua's own imgui_demo.lua does
+    -- it), but on the line is better anyway: a hint nobody has to hover to find.
     for _, mode in ipairs(WIDGET_MODES) do
         if mode.id == cfg.widget_mode then
             imgui.SameLine()
