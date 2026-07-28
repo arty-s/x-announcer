@@ -87,6 +87,11 @@ cabin quiet       nothing is playing
 queued: N         N calls waiting
 background        background music is playing
 
+Pin this to the screen
+                  show that same phase ladder over the simulator view without
+                  keeping the panel open - see THE ON-SCREEN WIDGET below.
+                  Density, opacity and position are at the top of Settings
+
 Buttons:
 Mute announcer    silence the plugin entirely (becomes Un-mute)
 Skip current      cut the current call and move on
@@ -131,6 +136,9 @@ stop playback          the same from the tab header, with a timer, so it
 
 SETTINGS TAB
 ------------
+On-screen phase widget see THE ON-SCREEN WIDGET below.  It comes first
+                       because the switch is also on the Flight tab; what
+                       lives here is how the widget looks
 announcements          announcement volume
 boarding music         background music volume
 music ducking          how far music drops under an announcement
@@ -149,7 +157,6 @@ Audio routing          FMOD buses: interior, master, ui, com1.
 Language sub-folder    the language folder inside a pack (en-us, ...)
 Seatbelt sign dataref  your own seatbelt dataref if the search missed it
 window text scale      text size in the panel, larger for VR
-On-screen widget       see the next section
 
 
 THE ON-SCREEN WIDGET
@@ -158,7 +165,11 @@ A translucent plate over the simulator view.  It answers one question without
 opening the panel: which phase are we in, and what is the announcer waiting for
 before it moves to the next one.
 
-Show the phase widget  turn it on
+It is off until you ask for it.  Two checkboxes turn it on and they are the
+same switch: "Pin this to the screen" under the phase ladder on the Flight tab,
+and "Show it over the sim" at the top of the Settings tab.
+
+Show it over the sim   turn it on
 density                three of them:
 
   minimal   one line: the phase, the next phase and the one thing missing
@@ -189,7 +200,8 @@ unexpectedly quiet.
 
 The widget is painted over the picture and takes no clicks, so it can never
 swallow one meant for a switch in the cockpit.  Move it with the position
-sliders.
+sliders; it will not walk off the edge of the screen even if the offsets were
+saved on a larger monitor.
 
 
 SIMBRIEF
@@ -201,8 +213,10 @@ SimBrief pilot ID or username
         your numeric Pilot ID or your SimBrief account name.  The Pilot ID
         is in your account settings on simbrief.com.  Save to remember it.
 Fetch latest plan
-        ask for your most recent plan.  The request runs in the background,
-        the simulator does not stall; the answer usually takes a second.
+        ask for your most recent plan.  A separate process does the download,
+        so the simulator never waits for the answer; it usually takes a
+        second.  Starting that process can cost one brief stutter - that is
+        Windows creating a process, and Lua has no way around it.
 
 Nothing is applied on its own.  The plugin shows what it found and waits:
 

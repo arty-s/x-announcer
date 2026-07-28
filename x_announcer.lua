@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.1.0"
+local VERSION = "1.1.1"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -1655,7 +1655,26 @@ end
 -- file that this script polls once a second, because a blocking os.execute()
 -- would freeze the simulator for as long as the request takes.
 
-local IS_WINDOWS = SEP == "\\"
+-- NOT DIRECTORY_SEPARATOR: FlyWithLua fills that from XPLMGetDirectorySeparator(),
+-- and with native paths on it is "/" on Windows too - which is why 1.1.0 shipped a
+-- SimBrief that wrote a .sh file on Windows and never ran.  package.config comes
+-- from LuaJIT itself, which is built per platform, so it cannot lie; the drive
+-- letter is a second opinion in case a future build changes that.
+-- Takes its two inputs as arguments so the bench can ask about a platform it is
+-- not running on: half of this decision is untestable otherwise.
+local function detect_windows(lua_config, script_dir)
+    if (lua_config or "/"):sub(1, 1) == "\\" then return true end
+    return (script_dir or ""):match("^%a:") ~= nil
+end
+
+local IS_WINDOWS = detect_windows(package.config, SCRIPT_DIRECTORY)
+
+-- cmd.exe is fed these paths as arguments to move/start, so they go in with the
+-- separator Windows expects even when the rest of the script works in "/".
+local function shell_path(path)
+    if IS_WINDOWS then return (path:gsub("/", "\\")) end
+    return path
+end
 
 local SB_ENDPOINT = "https://www.simbrief.com/api/xml.fetcher.php?json=1&"
 local SB_OUT      = BASE_DIR .. "simbrief.json"
@@ -1669,6 +1688,7 @@ local simbrief = {
     message = "",
     started = 0,
     plan    = nil,        -- what SimBrief answered, waiting for a yes/no
+    pending = nil,        -- command written but not launched yet, see simbrief_poll
 }
 
 -- The pilot id is pasted by the user and ends up inside a generated shell
@@ -1768,7 +1788,9 @@ local function simbrief_start()
     local key = id:match("^%d+$") and "userid" or "username"
     local url = SB_ENDPOINT .. key .. "=" .. id
 
-    local f = io.open(SB_SCRIPT, "w")
+    -- Binary on purpose: in text mode Windows turns the "\r\n" below into
+    -- "\r\r\n", and the line endings here are already the right ones.
+    local f = io.open(SB_SCRIPT, "wb")
     if not f then
         simbrief.status  = "error"
         simbrief.message = "cannot write " .. SB_SCRIPT
@@ -1782,8 +1804,10 @@ local function simbrief_start()
     local args = string.format('-s --max-filesize %d -m %d', SB_MAX_BYTES, SB_TIMEOUT)
     if IS_WINDOWS then
         f:write("@echo off\r\n")
-        f:write(string.format('curl.exe %s -o "%s" "%s"\r\n', args, SB_PART, url))
-        f:write(string.format('if not errorlevel 1 move /y "%s" "%s"\r\n', SB_PART, SB_OUT))
+        f:write(string.format('curl.exe %s -o "%s" "%s"\r\n',
+                              args, shell_path(SB_PART), url))
+        f:write(string.format('if not errorlevel 1 move /y "%s" "%s"\r\n',
+                              shell_path(SB_PART), shell_path(SB_OUT)))
     else
         f:write("#!/bin/sh\n")
         f:write(string.format('curl %s -o "%s" "%s" && mv "%s" "%s"\n',
@@ -1791,10 +1815,14 @@ local function simbrief_start()
     end
     f:close()
 
-    local cmd = IS_WINDOWS
-        and string.format('start "" /b "%s"', SB_SCRIPT)
+    -- os.execute() blocks the simulator thread for as long as it takes Windows to
+    -- create the process - a visible hitch in the frame the button was clicked in.
+    -- Handing it to the next tick does not make it cheaper, but it lets the panel
+    -- repaint with "asking SimBrief..." first, so the hitch lands on a frame the
+    -- user is no longer waiting on.
+    simbrief.pending = IS_WINDOWS
+        and string.format('start "" /b "%s"', shell_path(SB_SCRIPT))
         or  string.format('sh "%s" &', SB_SCRIPT)
-    os.execute(cmd)
 
     simbrief.status  = "fetching"
     simbrief.message = "asking SimBrief..."
@@ -1804,6 +1832,14 @@ end
 
 local function simbrief_poll()
     if simbrief.status ~= "fetching" then return end
+
+    if simbrief.pending then
+        local cmd = simbrief.pending
+        simbrief.pending = nil
+        simbrief.started = os.time()   -- the clock starts when curl does
+        os.execute(cmd)
+        return
+    end
 
     local raw = read_file(SB_OUT)
     if not raw then
@@ -2112,6 +2148,18 @@ local function draw_flight_tab()
         imgui.EndChild()
     end
 
+    -- The widget is this ladder in miniature, so its switch belongs against the
+    -- ladder rather than seven sections down the Settings tab, where the first
+    -- release hid it well enough that nobody found it.
+    imgui.Dummy(0, 2)
+    local pin_changed, pin_value = imgui.Checkbox("Pin this to the screen", cfg.widget)
+    if pin_changed then cfg.widget = pin_value config_save() end
+    imgui.SameLine()
+    text_col(COL.dim, cfg.widget
+        and ("  " .. cfg.widget_mode .. " - size and place it on the Settings tab")
+        or  "  draws the phase over the cockpit view")
+
+    imgui.Dummy(0, 4)
     imgui.Separator()
     imgui.Dummy(0, 4)
 
@@ -2373,6 +2421,38 @@ end
 local function draw_settings_tab()
     local changed, value
 
+    text_col(COL.muted, "On-screen phase widget")
+    changed, value = imgui.Checkbox("Show it over the sim", cfg.widget)
+    if changed then cfg.widget = value config_save() end
+    imgui.SameLine()
+    text_col(COL.dim, "  same switch as on the Flight tab")
+
+    imgui.SetNextItemWidth(160)
+    if imgui.BeginCombo("density", cfg.widget_mode) then
+        for _, mode in ipairs(WIDGET_MODES) do
+            if imgui.Selectable(mode.id, cfg.widget_mode == mode.id) then
+                cfg.widget_mode = mode.id
+                config_save()
+            end
+            if imgui.IsItemHovered() then imgui.SetTooltip(mode.hint) end
+        end
+        imgui.EndCombo()
+    end
+
+    imgui.SetNextItemWidth(200)
+    changed, value = imgui.SliderFloat("backing opacity", cfg.widget_opacity, 0, 1, "%.2f")
+    if changed then cfg.widget_opacity = value config_save() end
+    imgui.SetNextItemWidth(120)
+    changed, value = imgui.SliderInt("from the left", round(cfg.widget_x), 0, 2000, "%d px")
+    if changed then cfg.widget_x = value config_save() end
+    imgui.SetNextItemWidth(120)
+    changed, value = imgui.SliderInt("from the top", round(cfg.widget_y), 0, 1400, "%d px")
+    if changed then cfg.widget_y = value config_save() end
+
+    imgui.Dummy(0, 6)
+    imgui.Separator()
+    imgui.Dummy(0, 4)
+
     text_col(COL.muted, "Volume")
     imgui.SetNextItemWidth(200)
     changed, value = imgui.SliderFloat("announcements", cfg.volume, 0, 1, "%.2f")
@@ -2454,36 +2534,6 @@ local function draw_settings_tab()
     imgui.SetNextItemWidth(200)
     changed, value = imgui.SliderFloat("window text scale", cfg.window_scale, 0.8, 2.0, "%.2f")
     if changed then cfg.window_scale = value config_save() end
-
-    imgui.Dummy(0, 6)
-    imgui.Separator()
-    imgui.Dummy(0, 4)
-
-    text_col(COL.muted, "On-screen widget")
-    changed, value = imgui.Checkbox("Show the phase widget over the sim", cfg.widget)
-    if changed then cfg.widget = value config_save() end
-
-    imgui.SetNextItemWidth(160)
-    if imgui.BeginCombo("density", cfg.widget_mode) then
-        for _, mode in ipairs(WIDGET_MODES) do
-            if imgui.Selectable(mode.id, cfg.widget_mode == mode.id) then
-                cfg.widget_mode = mode.id
-                config_save()
-            end
-            if imgui.IsItemHovered() then imgui.SetTooltip(mode.hint) end
-        end
-        imgui.EndCombo()
-    end
-
-    imgui.SetNextItemWidth(200)
-    changed, value = imgui.SliderFloat("backing opacity", cfg.widget_opacity, 0, 1, "%.2f")
-    if changed then cfg.widget_opacity = value config_save() end
-    imgui.SetNextItemWidth(120)
-    changed, value = imgui.SliderInt("from the left", round(cfg.widget_x), 0, 2000, "%d px")
-    if changed then cfg.widget_x = value config_save() end
-    imgui.SetNextItemWidth(120)
-    changed, value = imgui.SliderInt("from the top", round(cfg.widget_y), 0, 1400, "%d px")
-    if changed then cfg.widget_y = value config_save() end
 
     imgui.Dummy(0, 6)
     imgui.Separator()
@@ -2708,9 +2758,13 @@ function xa_draw_widget()
     width = width + WIDGET_PAD * 2
 
     local screen_h = SCREEN_HIGHT or SCREEN_HEIGHT or 1080
+    local screen_w = SCREEN_WIDTH or 1920
     local height = #lines * WIDGET_LINE + WIDGET_PAD * 2
-    local left   = cfg.widget_x
-    local top    = screen_h - cfg.widget_y
+    -- Kept on screen whatever the saved offsets say: a resolution change, or a
+    -- slider pushed too far, would otherwise draw the widget into the void and
+    -- look exactly like the widget being broken.
+    local left = clamp(cfg.widget_x, 0, math.max(0, screen_w - width))
+    local top  = screen_h - clamp(cfg.widget_y, 0, math.max(0, screen_h - height))
 
     -- Other scripts draw too and may leave the state however they like.
     XPLMSetGraphicsState(0, 0, 0, 1, 1, 0, 0)
@@ -2803,6 +2857,10 @@ XA_DEBUG = {
     simbrief = function() return simbrief end,
     sb_parse = simbrief_parse,
     sb_id    = simbrief_id,
+    sb_start = simbrief_start,
+    sb_script  = function() return SB_SCRIPT end,
+    sb_windows = function() return IS_WINDOWS end,
+    is_windows = detect_windows,
     library  = function() return library end,
     state    = function() return F end,
     queue    = function() return queue, now_playing, music end,

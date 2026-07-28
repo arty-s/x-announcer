@@ -175,9 +175,9 @@ used only when an add-on provides them.
 - **Library** — the library path, rescan, airline choice, and a table of events
   showing how many files exist, which pack they come from, and a `play` button
   to audition a call in the sim. A preview does not count for the flight.
-- **Settings** — volumes and ducking, which calls to play, welcome repeat
-  interval, SimBrief, FMOD buses, language sub-folder, seatbelt dataref, and
-  panel text scale for VR.
+- **Settings** — how the on-screen widget looks, volumes and ducking, which calls
+  to play, welcome repeat interval, SimBrief, FMOD buses, language sub-folder,
+  seatbelt dataref, and panel text scale for VR.
 - **Log** — what played and why, and why something did not.
 
 ### The on-screen widget
@@ -199,8 +199,11 @@ full      done  Takeoff                           . descending        120 fpm
           . below 11 000 ft   34000
 ```
 
-Opacity and position are adjustable, and it takes no clicks — it cannot swallow
-one meant for a switch in the cockpit. It is drawn with FlyWithLua's graphics
+It is off until you ask for it: tick **Pin this to the screen** under the phase
+ladder on the Flight tab, or **Show it over the sim** at the top of Settings —
+the same switch in both places. Density, opacity and position are adjustable, it
+stays on screen whatever the offsets say, and it takes no clicks — it cannot
+swallow one meant for a switch in the cockpit. It is drawn with FlyWithLua's graphics
 module rather than as a second ImGui window on purpose: FlyWithLua calls
 `ImGui::Begin()` itself before handing control to a window builder, and ImGui
 samples the window background colour there, so the background alpha of an imgui

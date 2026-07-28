@@ -133,9 +133,13 @@ def build_runtime(sim, library, config_extra="", livery_path=""):
         f.write(config_extra)
 
     g.SUPPORTS_FLOATING_WINDOWS = True
-    g.DIRECTORY_SEPARATOR = "\\"
-    g.SCRIPT_DIRECTORY = tmp + "\\"
-    g.SYSTEM_DIRECTORY = tmp + "\\"
+    # The real value, not the intuitive one: FlyWithLua sets DIRECTORY_SEPARATOR
+    # from XPLMGetDirectorySeparator(), which with native paths is "/" on Windows
+    # too.  The bench used to hand out "\\" here, which no X-Plane ever does, and
+    # that is precisely why it missed the SimBrief bug in 1.1.0.
+    g.DIRECTORY_SEPARATOR = "/"
+    g.SCRIPT_DIRECTORY = tmp + "/"
+    g.SYSTEM_DIRECTORY = tmp + "/"
     g.PLUGIN_VERSION = "2.8.10"
     g.PLANE_ICAO = "A320"
     g.PLANE_TAILNUMBER = "VP-BKA"
@@ -275,6 +279,11 @@ def build_runtime(sim, library, config_extra="", livery_path=""):
     # wall clock is made controllable too - and can be driven at a rate different
     # from sim time, which is how the sim's time acceleration is emulated.
     lua.execute("XA_TEST_WALL = 0 os.time = function() return XA_TEST_WALL end")
+
+    # Nothing in the bench may actually reach the network or spawn a process.
+    lua.execute("OS_EXEC_CALLS = {} "
+                "os.execute = function(cmd) "
+                "  OS_EXEC_CALLS[#OS_EXEC_CALLS + 1] = tostring(cmd) return 0 end")
 
     # Faithful macro stubs: FlyWithLua runs the macro's own code when the entry is
     # registered and again on every activate_macro()/deactivate_macro() call, so a
@@ -1027,6 +1036,90 @@ def scenario_simbrief(library):
     check(all(c.isalnum() or c in "_-." for c in cleaned),
           "quotes and shell metacharacters are stripped from the pilot ID")
 
+    # --- the platform decision, both branches ------------------------------
+    # 1.1.0 read the platform off DIRECTORY_SEPARATOR and so wrote a /bin/sh
+    # script on Windows, which nothing there can run.  The decision now takes its
+    # inputs as arguments, so the branch this machine is not running can be asked
+    # about too.
+    is_windows = lua.globals().XA_DEBUG.is_windows
+    WIN_CONF, POSIX_CONF = "\\\n;\n?\n!\n-\n", "/\n;\n?\n!\n-\n"
+    cases = [
+        (WIN_CONF,   "E:\\SteamLibrary/steamapps/common/X-Plane 12/", True,
+         "Windows with native paths on - the shape that shipped broken"),
+        (WIN_CONF,   "E:\\SteamLibrary\\steamapps\\", True,
+         "Windows with native paths off"),
+        (POSIX_CONF, "/home/pilot/X-Plane 12/Resources/", False,
+         "Linux is not mistaken for Windows"),
+        (POSIX_CONF, "/Users/pilot/X-Plane 12/Resources/", False,
+         "macOS is not mistaken for Windows"),
+        (POSIX_CONF, "D:/X-Plane 12/Resources/", True,
+         "a drive letter alone is enough, whatever LuaJIT claims"),
+    ]
+    for conf, script_dir, want, why in cases:
+        check(bool(is_windows(conf, script_dir)) == want, why)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def scenario_simbrief_launch(library):
+    """What actually gets written to disk and run, on this machine."""
+    print("\n=== scenario 11b: the SimBrief fetch script ===")
+    sim = Sim()
+    lua, tmp = build_runtime(
+        sim, library, "airline_mode = auto\nauto_find = false\nsimbrief_id = 123456\n")
+    run_script(lua)
+    g = lua.globals()
+
+    on_windows = bool(g.XA_DEBUG.sb_windows())
+    script = g.XA_DEBUG.sb_script()
+    print("      platform: %s" % ("Windows" if on_windows else "POSIX"))
+    print("      script:   %s" % script)
+    check(on_windows == (os.name == "nt"),
+          "the platform is read correctly with DIRECTORY_SEPARATOR = '/'")
+    check(script.endswith(".cmd" if on_windows else ".sh"),
+          "the fetch script is a %s" % (".cmd" if on_windows else ".sh"))
+
+    # Clicking Fetch must not stall the frame: the command is written now and run
+    # from the next tick, after the panel has repainted with "asking SimBrief...".
+    g.XA_DEBUG.sb_start()
+    calls = list(g.OS_EXEC_CALLS.values())
+    check(len(calls) == 0, "clicking Fetch does not run a process inside the frame")
+    check(g.XA_DEBUG.simbrief().status == "fetching",
+          "the panel says it is fetching straight away")
+    g.xa_tick()
+    calls = list(g.OS_EXEC_CALLS.values())
+    check(len(calls) == 1, "the fetch is launched on the next tick")
+    if calls:
+        print("      command:  %s" % calls[0])
+        if on_windows:
+            check(calls[0].startswith('start "" /b'),
+                  "Windows launches it detached with start /b")
+            check("/" not in calls[0].split('"')[-2],
+                  "the path handed to cmd.exe uses backslashes")
+        else:
+            check(calls[0].startswith("sh ") and calls[0].endswith("&"),
+                  "POSIX launches it detached with sh ... &")
+
+    body = ""
+    if os.path.exists(script):
+        with open(script, "r", encoding="utf-8", errors="replace") as f:
+            body = f.read()
+    check(body != "", "the fetch script was written to disk")
+    for line in body.splitlines():
+        print("      | %s" % line)
+    if on_windows:
+        check("#!/bin/sh" not in body, "no /bin/sh script on Windows - the 1.1.0 bug")
+        check("curl.exe" in body and "move /y" in body, "cmd.exe syntax is used")
+        check("\\simbrief.part" in body and "\\simbrief.json" in body,
+              "move gets backslash paths, which is what cmd.exe understands")
+    else:
+        check(body.startswith("#!/bin/sh"), "a shell script is written")
+        check("curl " in body and " && mv " in body, "sh syntax is used")
+    check("simbrief.com" in body and "userid=123456" in body,
+          "the request goes to SimBrief with the configured pilot ID")
+    check(" -L" not in body and "--max-filesize" in body,
+          "redirects stay off and the answer size stays capped")
+
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -1080,6 +1173,20 @@ def scenario_widget(library):
     lines = widget_text(lua)
     check(any(l == "warn|muted" for l in lines), "muted is called out in red")
     lua.execute("XA_DEBUG.config.enabled = true")
+
+    # Offsets saved on a bigger monitor, or a slider dragged to the end, must not
+    # park the widget outside the screen - that is indistinguishable from the
+    # widget being broken, which is how this feature was received the first time.
+    lua.execute("XA_DEBUG.config.widget_mode = 'medium' "
+                "XA_DEBUG.config.widget_x = 5000 XA_DEBUG.config.widget_y = 5000 "
+                "GRAPHICS_CALLS = {} xa_draw()")
+    rects = [c for c in lua.globals().GRAPHICS_CALLS.values() if c.startswith("rect")]
+    check(len(rects) == 1, "the widget still paints with impossible offsets")
+    if rects:
+        x1, y1, x2, y2 = (int(v) for v in rects[0].split()[1:])
+        print("      clamped plate: x %d..%d  y %d..%d  (screen 1920x1080)" % (x1, x2, y1, y2))
+        check(x1 >= 0 and x2 <= 1920, "the plate stays inside the screen horizontally")
+        check(y1 >= 0 and y2 <= 1080, "the plate stays inside the screen vertically")
 
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1149,6 +1256,7 @@ def main():
     scenario_survival(library)
     scenario_livery_detection(library)
     scenario_simbrief(library)
+    scenario_simbrief_launch(library)
     scenario_widget(library)
     scenario_widget_matches_machine(library)
     scenario_durations(library)
