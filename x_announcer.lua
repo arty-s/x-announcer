@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -187,6 +187,11 @@ local cfg = {
     auto_find        = true,      -- look for an existing UA_Sounds folder
     music_max_loops  = 6,         -- see the note about FlyWithLua's FMOD memory
     simbrief_id      = "",        -- SimBrief pilot ID or account name
+    widget           = false,     -- on-screen phase widget
+    widget_mode      = "medium",  -- minimal | medium | full
+    widget_opacity   = 0.55,      -- of the plate behind the text, 0 = none
+    widget_x         = 20,        -- pixels from the left edge
+    widget_y         = 60,        -- pixels from the top edge
 }
 
 local CFG_ORDER = {
@@ -196,6 +201,7 @@ local CFG_ORDER = {
     "boarding_repeat", "pilot_welcome", "door_calls", "night_dim",
     "landing_reaction", "seatbelt_dref", "window_scale", "auto_find",
     "music_max_loops", "simbrief_id",
+    "widget", "widget_mode", "widget_opacity", "widget_x", "widget_y",
 }
 
 local function config_load()
@@ -244,6 +250,11 @@ local CFG_HELP = {
     auto_find        = "искать готовую папку UA_Sounds, если в library паков не нашлось",
     music_max_loops  = "сколько раз зацикливать фоновый трек (FlyWithLua не освобождает память на каждом повторе)",
     simbrief_id      = "ваш SimBrief: числовой Pilot ID или имя учётной записи; пусто - не спрашивать SimBrief",
+    widget           = "показывать виджет фазы полёта поверх экрана симулятора",
+    widget_mode      = "плотность виджета: minimal - одна строка, medium - плюс условия перехода, full - плюс лестница фаз",
+    widget_opacity   = "непрозрачность подложки виджета, 0.0 - без подложки, 1.0 - глухая",
+    widget_x         = "отступ виджета от левого края экрана, пикселей",
+    widget_y         = "отступ виджета от верхнего края экрана, пикселей",
 }
 
 local function config_save()
@@ -1461,6 +1472,81 @@ local function state_machine()
     end
 end
 
+-- What the state machine above is waiting for, in a form the on-screen widget
+-- can draw: the conditions that move us to the NEXT phase, each with its live
+-- value.  This mirrors state_machine() and lives next to it on purpose - the
+-- test bench flies a whole flight and checks that a phase never advances while
+-- this list still reports something unmet, which is what catches drift.
+local function phase_conditions()
+    if not F then return "-", {} end
+    local s = sim
+
+    local function yes(label, met, value)
+        return { label = label, met = met and true or false, value = value or "" }
+    end
+    local function ft(v) return string.format("%d", round(v or 0)) end
+
+    local p = F.phase
+
+    if p == "PREFLIGHT" then
+        local power = s.battery or s.nav_lights or s.logo or s.taxi_light
+        return "Boarding", {
+            yes("on the ground",   s.on_ground),
+            yes("engines off",     s.all_engines_off),
+            yes("beacon off",      not s.beacon),
+            yes("cabin power on",  power),
+        }
+    elseif p == "BOARDING" then
+        return "Doors & safety", {
+            yes("beacon on or engine started", s.beacon or s.any_engine),
+        }
+    elseif p == "PUSHBACK" then
+        return "Takeoff", {
+            yes("engine running",           s.any_engine),
+            yes("strobes / landing lights", s.strobe or s.landing_light),
+        }
+    elseif p == "TAKEOFF" then
+        return "Climb", {
+            yes("airborne", not s.on_ground),
+            yes("3000 ft AGL", s.agl_ft > 3000, ft(s.agl_ft)),
+        }
+    elseif p == "CLIMB" then
+        local held = F.level_since and (sim_clock - F.level_since) or 0
+        return "Cruise", {
+            yes("above 15 000 ft",  s.alt_ft > 15000, ft(s.alt_ft)),
+            yes("levelling off",    math.abs(s.vs_fpm or 0) < 350, ft(s.vs_fpm) .. " fpm"),
+            yes("held 25 s",        held > 25, string.format("%d s", round(held))),
+        }
+    elseif p == "CRUISE" then
+        return "Descent", {
+            yes("below 11 000 ft", s.alt_ft < 11000, ft(s.alt_ft)),
+            yes("descending",      (s.vs_fpm or 0) < -300, ft(s.vs_fpm) .. " fpm"),
+        }
+    elseif p == "DESCENT" then
+        return "Approach", {
+            yes("below 3000 ft AGL", s.agl_ft < 3000, ft(s.agl_ft)),
+            yes("descending",        (s.vs_fpm or 0) < -300, ft(s.vs_fpm) .. " fpm"),
+        }
+    elseif p == "APPROACH" then
+        return "After landing", {
+            yes("on the ground", s.on_ground),
+            yes("below 60 kt",   (s.gs_kt or 0) < 60, ft(s.gs_kt) .. " kt"),
+        }
+    elseif p == "TAXI_IN" then
+        return "Disembarking", {
+            yes("engines off",           s.all_engines_off),
+            yes("brake set or stopped",  s.parkbrake or (s.gs_kt or 0) < 1),
+            yes("beacon off",            not s.beacon),
+        }
+    elseif p == "DISEMBARK" then
+        local left = 120 - (sim_clock - F.phase_since)
+        return "Preflight", {
+            yes("turnaround", left <= 0, string.format("%d s", round(math.max(left, 0)))),
+        }
+    end
+    return "-", {}
+end
+
 -- The sim can drop the aircraft somewhere the state machine cannot reach on its
 -- own: teleport to a gate from the map, "start a new flight here", a repaired
 -- crash.  Without this the announcer sits in Cruise forever and says nothing.
@@ -1901,6 +1987,10 @@ end
 
 xa_frame = guarded("frame callback", frame_body)
 xa_tick  = guarded("state tick", tick_body)
+-- The widget builder is assigned further down, once it exists; the draw
+-- callback is guarded like the others because an error here would take the
+-- whole Lua engine down with every other script in the sim.
+xa_draw  = guarded("widget draw", function() if xa_draw_widget then xa_draw_widget() end end)
 
 ----------------------------------------------------------------------------
 -- 11.  User interface
@@ -2196,6 +2286,14 @@ local function bus_combo(label, key, other_key)
     end
 end
 
+-- Every script in the sim shares one Lua state, so this stays a local rather
+-- than a global the way the callbacks have to be.
+local WIDGET_MODES = {
+    { id = "minimal", hint = "one line: the phase and the one thing being waited for" },
+    { id = "medium",  hint = "adds every condition for the next phase, with live values" },
+    { id = "full",    hint = "adds the phase ladder around where you are now" },
+}
+
 -- How old the plan is, in the words a dispatcher would use.  This line is the
 -- whole reason the plan is not applied automatically: the usual mistake is
 -- loading into the sim before re-generating the OFP, and a timestamp alone
@@ -2361,6 +2459,36 @@ local function draw_settings_tab()
     imgui.Separator()
     imgui.Dummy(0, 4)
 
+    text_col(COL.muted, "On-screen widget")
+    changed, value = imgui.Checkbox("Show the phase widget over the sim", cfg.widget)
+    if changed then cfg.widget = value config_save() end
+
+    imgui.SetNextItemWidth(160)
+    if imgui.BeginCombo("density", cfg.widget_mode) then
+        for _, mode in ipairs(WIDGET_MODES) do
+            if imgui.Selectable(mode.id, cfg.widget_mode == mode.id) then
+                cfg.widget_mode = mode.id
+                config_save()
+            end
+            if imgui.IsItemHovered() then imgui.SetTooltip(mode.hint) end
+        end
+        imgui.EndCombo()
+    end
+
+    imgui.SetNextItemWidth(200)
+    changed, value = imgui.SliderFloat("backing opacity", cfg.widget_opacity, 0, 1, "%.2f")
+    if changed then cfg.widget_opacity = value config_save() end
+    imgui.SetNextItemWidth(120)
+    changed, value = imgui.SliderInt("from the left", round(cfg.widget_x), 0, 2000, "%d px")
+    if changed then cfg.widget_x = value config_save() end
+    imgui.SetNextItemWidth(120)
+    changed, value = imgui.SliderInt("from the top", round(cfg.widget_y), 0, 1400, "%d px")
+    if changed then cfg.widget_y = value config_save() end
+
+    imgui.Dummy(0, 6)
+    imgui.Separator()
+    imgui.Dummy(0, 4)
+
     text_col(COL.muted, "Sound handles")
     if imgui.Button("Reload sound files", 150, 22) then
         stop_announcement()
@@ -2475,6 +2603,135 @@ function xa_toggle()
     if ui.window then xa_hide() else xa_show() end
 end
 
+----------------------------------------------------------------------------
+-- 11b.  The on-screen widget
+----------------------------------------------------------------------------
+-- Answers one question over the cockpit view without opening the panel: which
+-- phase are we in, and what is the announcer waiting for.
+--
+-- Drawn with the graphics module rather than as a second imgui window on
+-- purpose.  FlyWithLua calls ImGui::Begin() itself before handing control to a
+-- window builder, and ImGui samples the window background colour there, so the
+-- background alpha of an imgui window cannot be reached from Lua at all.
+-- graphics.set_color() goes straight to glColor4f and takes a real alpha.
+
+local graphics_ok = pcall(require, "graphics")
+
+-- RGB floats matching COL above, plus the alpha the plate is drawn with.
+local WCOL = {
+    accent = { 1.00, 0.76, 0.29 },
+    text   = { 0.93, 0.93, 0.93 },
+    muted  = { 0.63, 0.58, 0.54 },
+    dim    = { 0.43, 0.39, 0.36 },
+    ok     = { 0.48, 0.85, 0.56 },
+    warn   = { 1.00, 0.42, 0.42 },
+}
+
+local WIDGET_LINE = 14        -- Helvetica 12 with a little air
+local WIDGET_PAD  = 8
+
+-- Build the widget as a list of coloured lines, then draw it.  Keeping the two
+-- apart means the layout can be tested without any of the drawing calls.
+local function widget_lines()
+    local out = {}
+    local function add(colour, text) out[#out + 1] = { c = colour, t = text } end
+
+    -- draw_flight_tab keeps its own copy; this one is not in scope here.
+    local index = PHASE_INDEX[F.phase] or 1
+    local phase = PHASES[index]
+    local head  = string.upper((phase and phase.label) or "-")
+
+    if guard.stopped then
+        add("accent", head) add("warn", "stopped after repeated errors")
+        return out
+    elseif frozen_reason then
+        add("accent", head) add("warn", "clock frozen: " .. frozen_reason)
+        return out
+    elseif not cfg.enabled then
+        add("accent", head) add("warn", "muted")
+        return out
+    end
+
+    local next_label, conditions = phase_conditions()
+    local mode = cfg.widget_mode
+
+    if now_playing then
+        add("accent", head)
+        add("text", string.format("> %s   %s / %s", now_playing.event,
+            mmss(real_clock - now_playing.started), mmss(now_playing.duration)))
+        if mode == "minimal" then return out end
+    elseif mode == "minimal" then
+        local waiting
+        for _, c in ipairs(conditions) do
+            if not c.met then waiting = c break end
+        end
+        add("accent", string.format("%s  ->  %s", head, next_label))
+        add("muted", waiting and ("waiting: " .. waiting.label) or "ready")
+        return out
+    else
+        add("accent", head)
+    end
+
+    if mode == "full" then
+        add("dim", "")
+        for i, p in ipairs(PHASES) do
+            if i >= index - 2 and i <= index + 2 then
+                if i < index then      add("dim",    "done  " .. p.label)
+                elseif i == index then add("accent", "> now " .. p.label)
+                else                   add("muted",  "      " .. p.label) end
+            end
+        end
+    end
+
+    add("dim", "")
+    add("muted", "next  " .. next_label)
+    for _, c in ipairs(conditions) do
+        local mark = c.met and "v " or ". "
+        local line = mark .. c.label
+        if c.value ~= "" then line = line .. "   " .. c.value end
+        add(c.met and "ok" or "muted", line)
+    end
+    return out
+end
+
+function xa_draw_widget()
+    if not cfg.widget or not graphics_ok or not F then return end
+
+    local lines = widget_lines()
+    if #lines == 0 then return end
+
+    local width = 0
+    for _, l in ipairs(lines) do
+        local w = measure_string(l.t, "Helvetica_12") or (#l.t * 6)
+        if w > width then width = w end
+    end
+    width = width + WIDGET_PAD * 2
+
+    local screen_h = SCREEN_HIGHT or SCREEN_HEIGHT or 1080
+    local height = #lines * WIDGET_LINE + WIDGET_PAD * 2
+    local left   = cfg.widget_x
+    local top    = screen_h - cfg.widget_y
+
+    -- Other scripts draw too and may leave the state however they like.
+    XPLMSetGraphicsState(0, 0, 0, 1, 1, 0, 0)
+
+    local alpha = clamp(cfg.widget_opacity, 0, 1)
+    if alpha > 0 then
+        graphics.set_color(0.05, 0.05, 0.05, alpha)
+        graphics.draw_rectangle(left, top - height, left + width, top)
+    end
+
+    local y = top - WIDGET_PAD - WIDGET_LINE + 3
+    for _, l in ipairs(lines) do
+        local c = WCOL[l.c] or WCOL.text
+        if l.t ~= "" then
+            graphics.set_color(c[1], c[2], c[3], 1.0)
+            draw_string_Helvetica_12(left + WIDGET_PAD, y, l.t)
+        end
+        y = y - WIDGET_LINE
+    end
+end
+
 function xa_skip()
     stop_announcement()
     queue.gap_until = real_clock
@@ -2541,6 +2798,8 @@ XA_DEBUG = {
     duration = probe_duration,
     airline  = function() return current_airline end,
     macro    = function() return MACRO_NAME end,
+    widget   = function() return widget_lines() end,
+    waiting  = function() local n, c = phase_conditions() return n, c end,
     simbrief = function() return simbrief end,
     sb_parse = simbrief_parse,
     sb_id    = simbrief_id,
@@ -2563,6 +2822,7 @@ XA_DEBUG = {
 
 do_every_frame("xa_frame()")
 do_often("xa_tick()")
+do_every_draw("xa_draw()")
 
 create_command("FlyWithLua/x_announcer/toggle_window",
     "X-Announcer: show/hide window", "xa_toggle()", "", "")

@@ -149,6 +149,47 @@ Audio routing          FMOD buses: interior, master, ui, com1.
 Language sub-folder    the language folder inside a pack (en-us, ...)
 Seatbelt sign dataref  your own seatbelt dataref if the search missed it
 window text scale      text size in the panel, larger for VR
+On-screen widget       see the next section
+
+
+THE ON-SCREEN WIDGET
+--------------------
+A translucent plate over the simulator view.  It answers one question without
+opening the panel: which phase are we in, and what is the announcer waiting for
+before it moves to the next one.
+
+Show the phase widget  turn it on
+density                three of them:
+
+  minimal   one line: the phase, the next phase and the one thing missing
+            CRUISE  ->  Descent
+            waiting: below 11 000 ft
+
+  medium    adds every condition for the next phase, with live values
+            CRUISE
+            next  Descent
+            . below 11 000 ft   34000
+            . descending        120 fpm
+
+  full      adds the phase ladder around where you are
+            done  Takeoff
+            done  Climb
+            > now Cruise
+                  Descent
+                  Approach
+
+backing opacity        how solid the plate is; 0.00 leaves text only
+from the left / top    where it sits, in pixels
+
+The mark on the left of a condition is a dot while it is unmet and a green v
+once it is satisfied.  While a call is playing the widget shows it and a timer
+instead of the conditions.  Pause, replay, Mute and the emergency stop override
+everything in red - which is the reason to glance at it when the cabin has gone
+unexpectedly quiet.
+
+The widget is painted over the picture and takes no clicks, so it can never
+swallow one meant for a switch in the cockpit.  Move it with the position
+sliders.
 
 
 SIMBRIEF

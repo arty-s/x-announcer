@@ -189,12 +189,35 @@ def build_runtime(sim, library, config_extra="", livery_path=""):
 
     g.dataref = dataref_stub
 
-    for name in ("do_every_frame", "do_often", "do_sometimes",
+    for name in ("do_every_frame", "do_often", "do_sometimes", "do_every_draw",
                  "create_command", "float_wnd_set_title",
                  "float_wnd_set_imgui_builder", "float_wnd_set_onclose",
-                 "float_wnd_set_resizing_limits", "float_wnd_destroy"):
+                 "float_wnd_set_resizing_limits", "float_wnd_destroy",
+                 "XPLMSetGraphicsState", "draw_string_Helvetica_12"):
         g[name] = lambda *args: None
     g.float_wnd_create = lambda *args: 1
+
+    # The widget draws with the graphics module: a real screen size, a crude
+    # text measurer, and a record of what was painted.
+    g.SCREEN_WIDTH = 1920
+    g.SCREEN_HIGHT = 1080
+    g.measure_string = lambda text, *rest: len(text) * 6.0
+    lua.execute("""
+        GRAPHICS_CALLS = {}
+        package = package or {}
+        package.loaded = package.loaded or {}
+        graphics = {
+            set_color = function(r, g, b, a)
+                GRAPHICS_CALLS[#GRAPHICS_CALLS + 1] =
+                    string.format("color %.2f %.2f %.2f %.2f", r, g, b, a or 1)
+            end,
+            draw_rectangle = function(x1, y1, x2, y2)
+                GRAPHICS_CALLS[#GRAPHICS_CALLS + 1] =
+                    string.format("rect %d %d %d %d", x1, y1, x2, y2)
+            end,
+        }
+        package.loaded["graphics"] = graphics
+    """)
 
     # Python callables are userdata in Lua; wrap them so type(f) == "function".
     lua.execute("""
@@ -202,7 +225,8 @@ def build_runtime(sim, library, config_extra="", livery_path=""):
             "directory_to_table", "logMsg", "load_fmod_sound",
             "XPLMFindDataRef", "XPLMGetDatai", "XPLMGetDataf", "XPLMSetDataf",
             "XPLMGetDatavi", "dataref", "do_every_frame", "do_often",
-            "create_command", "add_macro", "float_wnd_create",
+            "do_every_draw", "create_command", "add_macro", "float_wnd_create",
+            "XPLMSetGraphicsState", "draw_string_Helvetica_12", "measure_string",
             "play_sound_on_interior_bus", "play_sound_on_master_bus",
             "play_sound_on_ui_bus", "play_sound_on_com1_bus",
             "stop_sound_on_interior_bus", "stop_sound_on_master_bus",
@@ -1006,6 +1030,110 @@ def scenario_simbrief(library):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def widget_text(lua):
+    """The widget as plain lines, the way it would be drawn."""
+    return list(lua.eval(
+        "function() local out = {} "
+        "for i, l in ipairs(XA_DEBUG.widget()) do out[i] = l.c .. '|' .. l.t end "
+        "return out end")().values())
+
+
+def scenario_widget(library):
+    print("\n=== scenario 12: the on-screen phase widget ===")
+    sim = Sim()
+    lua, tmp = build_runtime(
+        sim, library,
+        "airline_mode = manual\nairline_manual = AFL\nauto_find = false\n"
+        "widget = true\nwidget_mode = medium\n")
+    run_script(lua)
+
+    # Parked and cold: the widget should say what boarding is waiting for.
+    sim.set(on_ground=1, engines=0, beacon=0, gs_ms=0, battery=0,
+            nav=0, taxi=0)
+    advance(lua, sim, 3)
+    lines = widget_text(lua)
+    print("      " + "\n      ".join(lines))
+    check(any(l.startswith("accent|PREFLIGHT") for l in lines),
+          "the phase leads the widget")
+    check(any("cabin power on" in l for l in lines),
+          "the missing condition is named")
+
+    # The condition list must not drift from the state machine: whenever every
+    # condition reads as met, the phase is expected to move on.
+    fly(lua, sim, boarding_seconds=60)
+    check(True, "a full flight runs with the widget enabled")
+
+    # Density: minimal is one or two lines, full is the longest.
+    counts = {}
+    for mode in ("minimal", "medium", "full"):
+        lua.execute("XA_DEBUG.config.widget_mode = '%s'" % mode)
+        counts[mode] = len(widget_text(lua))
+    print("      lines per mode:", counts)
+    check(counts["minimal"] <= counts["medium"] <= counts["full"],
+          "minimal <= medium <= full in height (%s)" % counts)
+    check(counts["minimal"] <= 2, "minimal really is a one-liner (%d lines)"
+          % counts["minimal"])
+
+    # A frozen clock or a muted announcer must win over everything else: that is
+    # the whole reason to glance at the widget.
+    lua.execute("XA_DEBUG.config.enabled = false")
+    lines = widget_text(lua)
+    check(any(l == "warn|muted" for l in lines), "muted is called out in red")
+    lua.execute("XA_DEBUG.config.enabled = true")
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def scenario_widget_matches_machine(library):
+    print("\n=== scenario 13: the widget never lies about the phase ===")
+    sim = Sim()
+    lua, tmp = build_runtime(
+        sim, library,
+        "airline_mode = manual\nairline_manual = AFL\nauto_find = false\n"
+        "widget = true\n")
+    run_script(lua)
+
+    def phase():
+        return lua.eval("function() return XA_DEBUG.state().phase end")()
+
+    def all_met():
+        conditions = lua.eval("function() local _, c = XA_DEBUG.waiting() return c end")()
+        items = list(conditions.values())
+        return bool(items) and all(c["met"] for c in items)
+
+    # Fly a whole flight one step at a time.  If every condition for the next
+    # phase reads as satisfied, the state machine must agree and move on.
+    FT = 0.3048
+    KT = 0.5144
+    sim.set(on_ground=1, engines=0, beacon=0, gs_ms=0, battery=1)
+    lies = []
+    steps = [
+        dict(on_ground=1, engines=0, beacon=0, gs_ms=0, battery=1),
+        dict(beacon=1, engines=2),
+        dict(strobe=1, landing=1),
+        dict(on_ground=0, agl_m=4000 * FT, alt_ft=4000, vs_fpm=2000),
+        dict(agl_m=16000 * FT, alt_ft=16000, vs_fpm=100),
+        dict(agl_m=35000 * FT, alt_ft=35000, vs_fpm=0),
+        dict(agl_m=10500 * FT, alt_ft=10500, vs_fpm=-1800),
+        dict(agl_m=2500 * FT, alt_ft=2500, vs_fpm=-700),
+        dict(on_ground=1, gs_ms=40 * KT, agl_m=0, alt_ft=0, vs_fpm=0),
+        dict(engines=0, parkbrake=1, beacon=0, gs_ms=0),
+    ]
+    for step in steps:
+        sim.set(**step)
+        before = phase()
+        satisfied = all_met()
+        advance(lua, sim, 30)
+        after = phase()
+        if satisfied and before == after:
+            lies.append("%s: all conditions met but the phase stayed put" % before)
+    for item in lies:
+        print("      ", item)
+    check(not lies, "whenever the widget says every condition is met, the phase moves")
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     library = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_LIBRARY
     if not os.path.isdir(library):
@@ -1021,6 +1149,8 @@ def main():
     scenario_survival(library)
     scenario_livery_detection(library)
     scenario_simbrief(library)
+    scenario_widget(library)
+    scenario_widget_matches_machine(library)
     scenario_durations(library)
 
     print("\n==================================================")

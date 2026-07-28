@@ -180,6 +180,32 @@ used only when an add-on provides them.
   panel text scale for VR.
 - **Log** — what played and why, and why something did not.
 
+### The on-screen widget
+
+A translucent plate over the simulator view that says which phase you are in and
+what the announcer is waiting for, so you never have to open the panel to find
+out why the cabin has gone quiet. Three densities:
+
+```
+minimal   CRUISE  ->  Descent            medium   CRUISE
+          waiting: below 11 000 ft                next  Descent
+                                                  . below 11 000 ft   34000
+full      done  Takeoff                           . descending        120 fpm
+          done  Climb
+          > now Cruise                   A dot means the condition is not met
+                Descent                  yet, a green v means it is.  Pause,
+                Approach                 replay and Mute override in red.
+          next  Descent
+          . below 11 000 ft   34000
+```
+
+Opacity and position are adjustable, and it takes no clicks — it cannot swallow
+one meant for a switch in the cockpit. It is drawn with FlyWithLua's graphics
+module rather than as a second ImGui window on purpose: FlyWithLua calls
+`ImGui::Begin()` itself before handing control to a window builder, and ImGui
+samples the window background colour there, so the background alpha of an imgui
+window cannot be reached from Lua at all.
+
 Commands available for binding: `FlyWithLua/x_announcer/toggle_window`,
 `FlyWithLua/x_announcer/skip`, `FlyWithLua/x_announcer/start_boarding`.
 
@@ -210,7 +236,7 @@ pip install lupa
 python tests/sim_test.py "D:\UA_Sounds"
 ```
 
-81 checks covering the phase machine, the audio queue, pause and time
+88 checks covering the phase machine, the audio queue, pause and time
 acceleration, config round-trips, airline detection against real livery folder
 names, SimBrief parsing, and the failure modes that can silence the plugin.
 
