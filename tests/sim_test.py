@@ -285,6 +285,71 @@ def build_runtime(sim, library, config_extra="", livery_path=""):
                 "os.execute = function(cmd) "
                 "  OS_EXEC_CALLS[#OS_EXEC_CALLS + 1] = tostring(cmd) return 0 end")
 
+    # A stand-in for LuaSocket.  It is scriptable so the whole state machine can
+    # be walked: a connect that finishes at once, or after a few frames, or never;
+    # a partial send; an answer arriving in pieces; and a close that either
+    # carries the last piece with it or does not - stacks differ on that, and the
+    # code has to survive both.
+    lua.execute("""
+        FAKE_NET = {
+            connect = "pending", writable_after = 1, send = "ok",
+            response = "", chunk = 4096, pos = 1, selects = 0,
+            closes = 0, close_with_last = false, sent = "", sent_once = false,
+        }
+        local function fake_sock()
+            local s = {}
+            function s:settimeout(v) FAKE_NET.timeout = v end
+            function s:connect(host, port)
+                FAKE_NET.host, FAKE_NET.port = host, port
+                if FAKE_NET.connect == "immediate" then return 1 end
+                if FAKE_NET.connect == "error" then return nil, "connection refused" end
+                return nil, "timeout"
+            end
+            function s:send(data, i)
+                i = i or 1
+                if FAKE_NET.send == "error" then return nil, "broken pipe", i - 1 end
+                if FAKE_NET.send == "partial" and not FAKE_NET.sent_once then
+                    FAKE_NET.sent_once = true
+                    FAKE_NET.sent = FAKE_NET.sent .. data:sub(i, i + 9)
+                    return nil, "timeout", i + 9
+                end
+                FAKE_NET.sent = FAKE_NET.sent .. data:sub(i)
+                return #data
+            end
+            function s:receive(n)
+                if FAKE_NET.pos > #FAKE_NET.response then return nil, "closed", "" end
+                local want = math.min(n or 1, FAKE_NET.chunk)
+                local piece = FAKE_NET.response:sub(FAKE_NET.pos, FAKE_NET.pos + want - 1)
+                FAKE_NET.pos = FAKE_NET.pos + #piece
+                if FAKE_NET.pos > #FAKE_NET.response and FAKE_NET.close_with_last then
+                    return nil, "closed", piece
+                end
+                return nil, "timeout", piece
+            end
+            function s:getpeername()
+                FAKE_NET.selects = FAKE_NET.selects + 1
+                if FAKE_NET.selects >= FAKE_NET.writable_after then
+                    return "1.2.3.4", 80, "inet"
+                end
+                return nil
+            end
+            function s:close() FAKE_NET.closes = FAKE_NET.closes + 1 end
+            return s
+        end
+        package.loaded["socket"] = {
+            tcp = function()
+                if FAKE_NET.connect == "nosocket" then return nil end
+                return fake_sock()
+            end,
+            -- Not a stub but a tripwire: the LuaSocket manual says WinSock makes
+            -- select lie about writability on non-blocking TCP sockets, so this
+            -- code must never reach for it.
+            select = function()
+                error("socket.select must not be used - WinSock lies about writability")
+            end,
+        }
+    """)
+
     # Faithful macro stubs: FlyWithLua runs the macro's own code when the entry is
     # registered and again on every activate_macro()/deactivate_macro() call, so a
     # careless sync would recurse.  MACRO_MENU mirrors the checkmark in the menu.
@@ -1036,122 +1101,165 @@ def scenario_simbrief(library):
     check(all(c.isalnum() or c in "_-." for c in cleaned),
           "quotes and shell metacharacters are stripped from the pilot ID")
 
-    # --- the platform decision, both branches ------------------------------
-    # 1.1.0 read the platform off DIRECTORY_SEPARATOR and so wrote a /bin/sh
-    # script on Windows, which nothing there can run.  The decision now takes its
-    # inputs as arguments, so the branch this machine is not running can be asked
-    # about too.
-    is_windows = lua.globals().XA_DEBUG.is_windows
-    WIN_CONF, POSIX_CONF = "\\\n;\n?\n!\n-\n", "/\n;\n?\n!\n-\n"
-    cases = [
-        (WIN_CONF,   "E:\\SteamLibrary/steamapps/common/X-Plane 12/", True,
-         "Windows with native paths on - the shape that shipped broken"),
-        (WIN_CONF,   "E:\\SteamLibrary\\steamapps\\", True,
-         "Windows with native paths off"),
-        (POSIX_CONF, "/home/pilot/X-Plane 12/Resources/", False,
-         "Linux is not mistaken for Windows"),
-        (POSIX_CONF, "/Users/pilot/X-Plane 12/Resources/", False,
-         "macOS is not mistaken for Windows"),
-        (POSIX_CONF, "D:/X-Plane 12/Resources/", True,
-         "a drive letter alone is enough, whatever LuaJIT claims"),
-    ]
-    for conf, script_dir, want, why in cases:
-        check(bool(is_windows(conf, script_dir)) == want, why)
-
     shutil.rmtree(tmp, ignore_errors=True)
 
 
 def scenario_simbrief_launch(library):
-    """What actually gets written to disk and run, on this machine."""
-    print("\n=== scenario 11b: the SimBrief fetch script ===")
+    """The non-blocking fetch: what goes on the wire, and how it is driven."""
+    print("\n=== scenario 11b: fetching the plan over a socket ===")
     sim = Sim()
     lua, tmp = build_runtime(
         sim, library, "airline_mode = auto\nauto_find = false\nsimbrief_id = 123456\n")
     run_script(lua)
     g = lua.globals()
 
-    on_windows = bool(g.XA_DEBUG.sb_windows())
-    script = g.XA_DEBUG.sb_script()
-    print("      platform: %s" % ("Windows" if on_windows else "POSIX"))
-    print("      script:   %s" % script)
-    check(on_windows == (os.name == "nt"),
-          "the platform is read correctly with DIRECTORY_SEPARATOR = '/'")
-    check(script.endswith(".cmd" if on_windows else ".sh"),
-          "the fetch script is a %s" % (".cmd" if on_windows else ".sh"))
+    ok_response = ("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                   "Connection: close\r\n\r\n" + (SIMBRIEF_OK % 1753000000))
 
-    # Clicking Fetch must not stall the frame: the command is written now and run
-    # from the next tick, after the panel has repainted with "asking SimBrief...".
+    def net(**kwargs):
+        """Arm the fake socket and clear whatever the last fetch left behind."""
+        lua.execute("FAKE_NET.pos = 1 FAKE_NET.selects = 0 FAKE_NET.sent = '' "
+                    "FAKE_NET.sent_once = false FAKE_NET.closes = 0 "
+                    "FAKE_NET.connect = 'pending' FAKE_NET.writable_after = 1 "
+                    "FAKE_NET.send = 'ok' FAKE_NET.chunk = 4096 "
+                    "FAKE_NET.close_with_last = false")
+        for key, value in kwargs.items():
+            if isinstance(value, bool):
+                lua.execute("FAKE_NET.%s = %s" % (key, "true" if value else "false"))
+            elif isinstance(value, str):
+                lua.globals().FAKE_NET[key] = value
+            else:
+                lua.execute("FAKE_NET.%s = %d" % (key, value))
+        lua.execute("XA_DEBUG.simbrief().status = 'idle'")
+
+    def pump(times=400):
+        for _ in range(times):
+            g.XA_DEBUG.sb_pump()
+            if g.XA_DEBUG.simbrief().status != "fetching":
+                return
+
+    def status():
+        sb = g.XA_DEBUG.simbrief()
+        return sb.status, sb.message
+
+    # --- what actually goes on the wire ------------------------------------
+    net(response=ok_response, writable_after=2)
     g.XA_DEBUG.sb_start()
-    calls = list(g.OS_EXEC_CALLS.values())
-    check(len(calls) == 0, "clicking Fetch does not run a process inside the frame")
-    check(g.XA_DEBUG.simbrief().status == "fetching",
-          "the panel says it is fetching straight away")
-    g.xa_tick()
-    calls = list(g.OS_EXEC_CALLS.values())
-    check(len(calls) == 1, "the fetch is launched on the next tick")
-    if calls:
-        print("      command:  %s" % calls[0])
-        if on_windows:
-            check(calls[0].startswith('start "" /b'),
-                  "Windows launches it detached with start /b")
-            check("/" not in calls[0].split('"')[-2],
-                  "the path handed to cmd.exe uses backslashes")
-        else:
-            check(calls[0].startswith("sh ") and calls[0].endswith("&"),
-                  "POSIX launches it detached with sh ... &")
+    check(status()[0] == "fetching", "the panel says it is fetching straight away")
+    request = g.XA_DEBUG.sb_request()
+    for line in request.rstrip().split("\r\n"):
+        print("      > %s" % line)
+    check(request.startswith("GET /api/xml.fetcher.php?json=1&userid=123456 HTTP/1.0"),
+          "a plain GET carrying the configured pilot ID")
+    check("Host: www.simbrief.com\r\n" in request, "the Host header names SimBrief")
+    check("Connection: close" in request,
+          "the connection is asked to close, so the body needs no chunk decoding")
+    check(request.endswith("\r\n\r\n"), "the header block is terminated properly")
 
-    body = ""
-    if os.path.exists(script):
-        with open(script, "r", encoding="utf-8", errors="replace") as f:
-            body = f.read()
-    check(body != "", "the fetch script was written to disk")
-    for line in body.splitlines():
-        print("      | %s" % line)
-    if on_windows:
-        check("#!/bin/sh" not in body, "no /bin/sh script on Windows - the 1.1.0 bug")
-        check("curl.exe" in body and "move /y" in body, "cmd.exe syntax is used")
-        check("\\simbrief.part" in body and "\\simbrief.json" in body,
-              "move gets backslash paths, which is what cmd.exe understands")
-        # curl ships with Windows 10 1803 and later, but that is not a promise:
-        # PowerShell is the second try so a missing curl is not a dead end.
-        check("powershell" in body and "DownloadFile" in body,
-              "PowerShell is the fallback when curl is missing")
-        check("Tls12" in body, "the fallback is pinned to TLS 1.2, not whatever is default")
-    else:
-        check(body.startswith("#!/bin/sh"), "a shell script is written")
-        check("curl " in body and "mv " in body, "sh syntax is used")
-        check("wget " in body, "wget is the fallback when curl is missing")
-    check(body.count("https://www.simbrief.com") >= 1 and "http://" not in body,
-          "every download path uses https, never plain http")
-    check("simbrief.com" in body and "userid=123456" in body,
-          "the request goes to SimBrief with the configured pilot ID")
-    check(" -L" not in body and "--max-filesize" in body,
-          "redirects stay off and the answer size stays capped")
-    check("simbrief.err" in body,
-          "the script leaves a marker when no downloader worked")
+    pump()
+    st, msg = status()
+    plan = g.XA_DEBUG.simbrief().plan
+    check(st == "ready" and plan is not None,
+          "the plan arrives and is parsed (%s %s)" % (st, msg))
+    if plan:
+        print("      < %s  %s -> %s" % (plan["callsign"], plan["origin"], plan["dest"]))
+        check(plan["airline"] == "SBI", "the airline came out of the answer")
+    check(g.FAKE_NET.host == "www.simbrief.com" and int(g.FAKE_NET.port) == 80,
+          "it connected to SimBrief on port 80")
+    check(int(g.FAKE_NET.closes) >= 1, "the socket is closed once the fetch is done")
+    check(g.FAKE_NET.sent == request, "the whole request went out, byte for byte")
 
-    # A failed download must say so rather than time out into a guess.
-    err_path = g.XA_DEBUG.sb_err()
-    with open(err_path, "w", encoding="utf-8") as f:
-        f.write("failed\n")
-    g.xa_tick()
-    sb = g.XA_DEBUG.simbrief()
-    print("      message:  %s" % sb.message)
-    check(sb.status == "error" and "download failed" in sb.message,
-          "the marker turns into a plain explanation, not 'no answer'")
-    check(not os.path.exists(err_path), "the marker is cleared once it is read")
+    # --- shapes the socket layer is allowed to take ------------------------
+    for label, kwargs in [
+        ("a connect that completes at once", dict(connect="immediate")),
+        ("a connect that takes several frames", dict(writable_after=6)),
+        ("an answer dribbling in 64 bytes at a time", dict(chunk=64)),
+        ("a close that carries the last piece with it", dict(close_with_last=True)),
+        ("a request that only half fits in the buffer", dict(send="partial")),
+    ]:
+        net(response=ok_response, **kwargs)
+        g.XA_DEBUG.sb_start()
+        pump()
+        st, msg = status()
+        check(st == "ready", "%s (%s %s)" % (label, st, msg))
 
-    # The fallbacks have no --max-filesize, so the cap is enforced here as well.
-    lua.execute("XA_DEBUG.simbrief().status = 'fetching' "
-                "XA_DEBUG.simbrief().pending = nil")
-    with open(g.XA_DEBUG.sb_script().replace("simbrief_fetch.cmd", "simbrief.json")
-              .replace("simbrief_fetch.sh", "simbrief.json"), "wb") as f:
-        f.write(b"x" * (9 * 1024 * 1024))
-    g.xa_tick()
-    sb = g.XA_DEBUG.simbrief()
-    print("      message:  %s" % sb.message)
-    check(sb.status == "error" and "too large" in sb.message,
-          "an oversized answer is refused instead of being read into memory")
+    # --- and the ways it can go wrong --------------------------------------
+    failures = [
+        ("no route to the host", dict(connect="error"), "cannot reach"),
+        ("the socket cannot even be made", dict(connect="nosocket"), "could not open"),
+        ("the request cannot be sent", dict(send="error"), "could not send"),
+        ("an error page instead of a plan",
+         dict(response="HTTP/1.1 503 Service Unavailable\r\n\r\nnope"), "answered 503"),
+        ("something that is not HTTP at all", dict(response="hello?"), "not an HTTP reply"),
+        ("a connection that closes saying nothing", dict(response=""), "without answering"),
+    ]
+    for label, kwargs, expect in failures:
+        payload = dict(response=ok_response)
+        payload.update(kwargs)
+        net(**payload)
+        g.XA_DEBUG.sb_start()
+        pump()
+        st, msg = status()
+        print("      %-40s -> %s" % (label, msg))
+        check(st == "error" and expect in msg, "%s is reported plainly" % label)
+
+    # An answer too big to be a flight plan is dropped rather than accumulated.
+    net(connect="immediate",
+        response="HTTP/1.1 200 OK\r\n\r\n" + "x" * (9 * 1024 * 1024),
+        chunk=1024 * 1024)
+    g.XA_DEBUG.sb_start()
+    pump()
+    st, msg = status()
+    print("      %-40s -> %s" % ("an answer far too large", msg))
+    check(st == "error" and "too large" in msg,
+          "an oversized answer is refused instead of being swallowed")
+
+    # A server that accepts the connection and then says nothing must not leave
+    # the panel on "asking SimBrief..." for ever.
+    net(response=ok_response, writable_after=10 ** 9)
+    g.XA_DEBUG.sb_start()
+    pump(30)
+    check(status()[0] == "fetching", "a slow connect is waited on, not aborted")
+    lua.execute("XA_TEST_WALL = XA_TEST_WALL + 10")
+    g.XA_DEBUG.sb_pump()
+    st, msg = status()
+    print("      %-40s -> %s" % ("a connect that never completes", msg))
+    check(st == "error" and "cannot reach" in msg,
+          "an unreachable host is called out early, not after the full timeout")
+    check(int(g.FAKE_NET.closes) >= 1, "the socket is closed on the way out")
+
+    # And a server that connects, takes the request and then goes quiet still has
+    # to be given up on rather than left spinning.
+    net(connect="immediate", response="HTTP/1.1 200 OK\r\n\r\n")
+    lua.execute("FAKE_NET.response = 'HTTP/1.1 200 OK' XA_DEBUG.simbrief().status = 'idle'")
+    g.XA_DEBUG.sb_start()
+    pump(5)
+    lua.execute("XA_TEST_WALL = XA_TEST_WALL + 60")
+    g.XA_DEBUG.sb_pump()
+    st, msg = status()
+    print("      %-40s -> %s" % ("a server that goes quiet mid-answer", msg))
+    check(st == "error", "a stalled answer gives up too (%s)" % msg)
+
+    # The pilot ID lands in the request line, so a newline pasted into it would
+    # otherwise be able to write headers of its own.
+    net(connect="immediate", response=ok_response)
+    lua.globals().XA_DEBUG.config.simbrief_id = "abc\r\nX-Evil: 1"
+    g.XA_DEBUG.sb_start()
+    request = g.XA_DEBUG.sb_request()
+    print("      request line: %s" % request.split("\r\n")[0])
+    check(not any(l.lower().startswith("x-evil") for l in request.split("\r\n")),
+          "a CR/LF pasted into the pilot ID cannot inject a header")
+    check("\r\n\r\n" not in request[:-4], "and cannot end the header block early")
+
+    # Finally: the pump is genuinely wired into the frame callback, not merely
+    # callable from the test.
+    lua.execute("XA_DEBUG.config.simbrief_id = '123456'")
+    net(connect="immediate", response=ok_response)
+    g.XA_DEBUG.sb_start()
+    for _ in range(120):
+        g.xa_frame()
+    check(g.XA_DEBUG.simbrief().status == "ready",
+          "the frame callback drives the fetch to completion")
 
     shutil.rmtree(tmp, ignore_errors=True)
 

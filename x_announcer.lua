@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.1.2"
+local VERSION = "1.1.3"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -1649,72 +1649,61 @@ end
 ----------------------------------------------------------------------------
 -- 9b.  SimBrief - optional, and never applied without being asked
 ----------------------------------------------------------------------------
--- FlyWithLua has no HTTP of its own: LuaSocket ships with it but without TLS,
--- and SimBrief is HTTPS only.  So the fetch is handed to curl, which comes with
--- Windows 10+, macOS and every desktop Linux.  It runs detached and writes to a
--- file that this script polls once a second, because a blocking os.execute()
--- would freeze the simulator for as long as the request takes.
+-- LuaSocket is compiled into FlyWithLua itself - luaopen_socket_core is in the
+-- binary - so this needs nothing installed.  What is NOT in the binary is any
+-- kind of TLS: there is no luaopen_ssl of any name and no ssl module anywhere in
+-- the plugin folder.  So the request goes over plain http, which the SimBrief
+-- API answers directly (200, no redirect to https, no HSTS).  That means the
+-- pilot ID and the flight plan travel in the clear; a flight plan is not worth
+-- protecting, and Artyom said so explicitly when this was weighed.
+--
+-- Up to 1.1.2 the download was handed to curl instead, precisely to keep https.
+-- Doing it here costs nothing at all in the frame: the socket is non-blocking
+-- and pumped a bit at a time, whereas spawning curl froze the frame for as long
+-- as the OS took to create a process.
+local socket_ok, socket = pcall(require, "socket")
+if not socket_ok then socket = nil end
 
--- NOT DIRECTORY_SEPARATOR: FlyWithLua fills that from XPLMGetDirectorySeparator(),
--- and with native paths on it is "/" on Windows too - which is why 1.1.0 shipped a
--- SimBrief that wrote a .sh file on Windows and never ran.  package.config comes
--- from LuaJIT itself, which is built per platform, so it cannot lie; the drive
--- letter is a second opinion in case a future build changes that.
--- Takes its two inputs as arguments so the bench can ask about a platform it is
--- not running on: half of this decision is untestable otherwise.
-local function detect_windows(lua_config, script_dir)
-    if (lua_config or "/"):sub(1, 1) == "\\" then return true end
-    return (script_dir or ""):match("^%a:") ~= nil
-end
-
-local IS_WINDOWS = detect_windows(package.config, SCRIPT_DIRECTORY)
-
--- cmd.exe is fed these paths as arguments to move/start, so they go in with the
--- separator Windows expects even when the rest of the script works in "/".
-local function shell_path(path)
-    if IS_WINDOWS then return (path:gsub("/", "\\")) end
-    return path
-end
-
-local SB_ENDPOINT = "https://www.simbrief.com/api/xml.fetcher.php?json=1&"
-local SB_OUT      = BASE_DIR .. "simbrief.json"
-local SB_PART     = BASE_DIR .. "simbrief.part"
-local SB_ERR      = BASE_DIR .. "simbrief.err"
-local SB_SCRIPT   = BASE_DIR .. (IS_WINDOWS and "simbrief_fetch.cmd" or "simbrief_fetch.sh")
-local SB_TIMEOUT  = 25
+local SB_HOST  = "www.simbrief.com"
+local SB_PORT  = 80
+local SB_PATH  = "/api/xml.fetcher.php?json=1&"
+local SB_TIMEOUT   = 25
+-- Connecting gets its own, shorter budget: a host that cannot be reached should
+-- say so long before the whole fetch gives up.
+local SB_CONNECT_TIMEOUT = 8
 local SB_MAX_BYTES = 8 * 1024 * 1024   -- a full OFP with navlog is well under this
+-- Read per frame.  At 30 fps this is several megabytes a second, so a 1.3 MB
+-- plan lands in a fraction of a second, and copying that much costs nothing.
+local SB_READ_CHUNK = 256 * 1024
 
 local simbrief = {
     status  = "idle",     -- idle | fetching | ready | error
     message = "",
     started = 0,
     plan    = nil,        -- what SimBrief answered, waiting for a yes/no
-    pending = nil,        -- command written but not launched yet, see simbrief_poll
+    -- connect -> connecting -> send -> receive, driven from the frame callback
+    stage   = nil,
+    sock    = nil,
+    request = nil,
+    sent    = 0,
+    buf     = nil,
+    nbuf    = 0,
 }
 
--- The pilot id is pasted by the user and ends up inside a generated shell
--- script, so anything outside a plain identifier is dropped rather than
--- escaped.  SimBrief ids are alphanumeric; nothing legitimate is lost.
+-- Up to 1.1.2 the fetch left a generated script and its scratch files in the
+-- plugin folder.  Nothing writes them any more, and a dead simbrief_fetch.cmd
+-- lying around reads like a symptom - it cost real time during one diagnosis.
+for _, stale in ipairs({ "simbrief_fetch.cmd", "simbrief_fetch.sh",
+                         "simbrief.part", "simbrief.err", "simbrief.json" }) do
+    os.remove(BASE_DIR .. stale)
+end
+
+-- The pilot id is pasted by the user and goes straight into the request line, so
+-- anything outside a plain identifier is dropped rather than escaped.  This is
+-- what keeps a CR or LF in the field from writing headers of its own.  SimBrief
+-- ids are alphanumeric; nothing legitimate is lost.
 local function simbrief_id()
     return (tostring(cfg.simbrief_id or ""):gsub("[^%w_%-%.]", ""))
-end
-
-local function read_file(path)
-    local f = io.open(path, "rb")
-    if not f then return nil end
-    local data = f:read("*a")
-    f:close()
-    return data
-end
-
--- Asked before reading: curl is told --max-filesize, but the fallbacks have no
--- equivalent, so the cap is enforced on this side too rather than trusted.
-local function file_size(path)
-    local f = io.open(path, "rb")
-    if not f then return nil end
-    local n = f:seek("end")
-    f:close()
-    return n
 end
 
 -- A scoped reader rather than a JSON parser.  SimBrief repeats key names across
@@ -1783,139 +1772,36 @@ local function simbrief_parse(raw)
     }
 end
 
-local function simbrief_start()
-    local id = simbrief_id()
-    if id == "" then
-        simbrief.status  = "error"
-        simbrief.message = "set your SimBrief pilot ID or username first"
-        return
-    end
-    if simbrief.status == "fetching" then return end
-
-    os.remove(SB_OUT)
-    os.remove(SB_PART)
-    os.remove(SB_ERR)
-
-    -- SimBrief takes either the numeric pilot id or the account name
-    local key = id:match("^%d+$") and "userid" or "username"
-    local url = SB_ENDPOINT .. key .. "=" .. id
-
-    -- Binary on purpose: in text mode Windows turns the "\r\n" below into
-    -- "\r\r\n", and the line endings here are already the right ones.
-    local f = io.open(SB_SCRIPT, "wb")
-    if not f then
-        simbrief.status  = "error"
-        simbrief.message = "cannot write " .. SB_SCRIPT
-        return
-    end
-    -- Download to a scratch name and rename on success, so the poller can never
-    -- read a half-written file.  If nothing here manages the download, the
-    -- script leaves a marker file behind: without it the panel can only say
-    -- "no answer", which is true of a missing tool and of a dead network alike.
-    --
-    -- curl is the first choice everywhere - it is in Windows since 10 1803, in
-    -- macOS since 10.1, and in every desktop Linux - but it is not a law of
-    -- nature, so each platform gets a second try with something that is:
-    -- PowerShell on Windows, wget on the rest.  In-process HTTP was considered
-    -- and rejected: FlyWithLua's LuaSocket has no TLS at all, so it could only
-    -- reach SimBrief over plain http, and its socket calls block the simulator
-    -- thread for the whole download.
-    --
-    -- No -L on purpose: without it curl will not follow a redirect somewhere
-    -- else, so the request can only ever reach simbrief.com.  --max-filesize
-    -- keeps a runaway answer from being read into memory whole; the fallbacks
-    -- have no such switch, which is why the poller checks the size as well.
-    local args = string.format('-s --max-filesize %d -m %d', SB_MAX_BYTES, SB_TIMEOUT)
-    if IS_WINDOWS then
-        local part, out = shell_path(SB_PART), shell_path(SB_OUT)
-        -- Single quotes are what PowerShell reads literally, so a path
-        -- containing one is escaped the way PowerShell wants: by doubling it.
-        local ps_part = part:gsub("'", "''")
-        f:write("@echo off\r\n")
-        f:write(string.format('curl.exe %s -o "%s" "%s"\r\n', args, part, url))
-        f:write("if not errorlevel 1 goto xa_done\r\n")
-        f:write(string.format('powershell -NoProfile -ExecutionPolicy Bypass -Command '
-            .. '"try{[Net.ServicePointManager]::SecurityProtocol='
-            .. '[Net.SecurityProtocolType]::Tls12;(New-Object Net.WebClient)'
-            .. ".DownloadFile('%s','%s')}catch{exit 1}\"\r\n", url, ps_part))
-        f:write("if not errorlevel 1 goto xa_done\r\n")
-        f:write(string.format('> "%s" echo failed\r\n', shell_path(SB_ERR)))
-        f:write("goto xa_end\r\n")
-        f:write(string.format(':xa_done\r\nmove /y "%s" "%s"\r\n:xa_end\r\n', part, out))
-    else
-        f:write("#!/bin/sh\n")
-        f:write(string.format('if curl %s -o "%s" "%s"; then mv "%s" "%s"\n',
-                              args, SB_PART, url, SB_PART, SB_OUT))
-        f:write(string.format('elif wget -q -T %d -O "%s" "%s"; then mv "%s" "%s"\n',
-                              SB_TIMEOUT, SB_PART, url, SB_PART, SB_OUT))
-        f:write(string.format('else rm -f "%s"; echo failed > "%s"; fi\n',
-                              SB_PART, SB_ERR))
-    end
-    f:close()
-
-    -- os.execute() blocks the simulator thread for as long as it takes Windows to
-    -- create the process - a visible hitch in the frame the button was clicked in.
-    -- Handing it to the next tick does not make it cheaper, but it lets the panel
-    -- repaint with "asking SimBrief..." first, so the hitch lands on a frame the
-    -- user is no longer waiting on.
-    simbrief.pending = IS_WINDOWS
-        and string.format('start "" /b "%s"', shell_path(SB_SCRIPT))
-        or  string.format('sh "%s" &', SB_SCRIPT)
-
-    simbrief.status  = "fetching"
-    simbrief.message = "asking SimBrief..."
-    simbrief.started = os.time()
-    log("simbrief: fetching the latest plan for %s=%s", key, id)
+-- Every exit from a fetch goes through these two, so a half-open socket can
+-- never be left behind for the next attempt to trip over.
+local function simbrief_close()
+    if simbrief.sock then pcall(function() simbrief.sock:close() end) end
+    simbrief.sock, simbrief.stage = nil, nil
+    simbrief.buf, simbrief.nbuf = nil, 0
 end
 
-local function simbrief_poll()
-    if simbrief.status ~= "fetching" then return end
+local function simbrief_fail(fmt, ...)
+    simbrief_close()
+    simbrief.status  = "error"
+    simbrief.message = string.format(fmt, ...)
+    log("simbrief: %s", simbrief.message)
+end
 
-    if simbrief.pending then
-        local cmd = simbrief.pending
-        simbrief.pending = nil
-        simbrief.started = os.time()   -- the clock starts when curl does
-        os.execute(cmd)
+local function simbrief_finish(raw)
+    local head_end = raw:find("\r\n\r\n", 1, true)
+    if not head_end then
+        simbrief_fail("the answer was not an HTTP reply")
+        return
+    end
+    local code = raw:sub(1, head_end):match("^HTTP/%d%.%d%s+(%d%d%d)")
+    if code ~= "200" then
+        simbrief_fail("SimBrief answered %s", code or "something unreadable")
         return
     end
 
-    -- The download script says so itself when neither tool worked, which beats
-    -- waiting out the timeout and then guessing at the reason.
-    if file_size(SB_ERR) then
-        os.remove(SB_ERR)
-        simbrief.status  = "error"
-        simbrief.message = IS_WINDOWS
-            and "download failed - no curl or PowerShell, or the network is down"
-            or  "download failed - no curl or wget, or the network is down"
-        log("simbrief: %s", simbrief.message)
-        return
-    end
-
-    local size = file_size(SB_OUT)
-    if size and size > SB_MAX_BYTES then
-        os.remove(SB_OUT)
-        simbrief.status  = "error"
-        simbrief.message = "the answer was far too large to be a flight plan"
-        log("simbrief: %s (%d bytes)", simbrief.message, size)
-        return
-    end
-
-    local raw = read_file(SB_OUT)
-    if not raw then
-        if os.time() - simbrief.started > SB_TIMEOUT + 10 then
-            simbrief.status  = "error"
-            simbrief.message = "no answer - is the network up?"
-            log("simbrief: %s", simbrief.message)
-        end
-        return
-    end
-    os.remove(SB_OUT)
-
-    local plan, err = simbrief_parse(raw)
+    local plan, err = simbrief_parse(raw:sub(head_end + 4))
     if not plan then
-        simbrief.status  = "error"
-        simbrief.message = err or "could not read the answer"
-        log("simbrief: %s", simbrief.message)
+        simbrief_fail("%s", err or "could not read the answer")
         return
     end
 
@@ -1925,6 +1811,138 @@ local function simbrief_poll()
     log("simbrief: %s%s %s-%s, generated %s", plan.airline, plan.flight,
         plan.origin, plan.dest,
         plan.generated > 0 and os.date("!%Y-%m-%d %H:%M UTC", plan.generated) or "?")
+end
+
+local function simbrief_start()
+    local id = simbrief_id()
+    if id == "" then
+        simbrief.status  = "error"
+        simbrief.message = "set your SimBrief pilot ID or username first"
+        return
+    end
+    if simbrief.status == "fetching" then return end
+    if not socket then
+        simbrief.status  = "error"
+        simbrief.message = "this FlyWithLua has no LuaSocket, so SimBrief is out of reach"
+        log("simbrief: %s", simbrief.message)
+        return
+    end
+
+    -- SimBrief takes either the numeric pilot id or the account name
+    local key = id:match("^%d+$") and "userid" or "username"
+
+    -- HTTP/1.0 with Connection: close on purpose.  Asked that way the server
+    -- sends the body straight through and closes, so "read until the connection
+    -- ends" is the whole framing; over HTTP/1.1 the same answer comes back
+    -- chunked and would need a chunk decoder for nothing.
+    simbrief.request = string.format(
+        "GET %s%s=%s HTTP/1.0\r\nHost: %s\r\nUser-Agent: X-Announcer/%s\r\n"
+        .. "Accept: application/json\r\nConnection: close\r\n\r\n",
+        SB_PATH, key, id, SB_HOST, VERSION)
+    simbrief.sent    = 0
+    simbrief.buf     = {}
+    simbrief.nbuf    = 0
+    simbrief.stage   = "connect"
+    simbrief.status  = "fetching"
+    simbrief.message = "asking SimBrief..."
+    simbrief.started = os.time()
+    log("simbrief: fetching the latest plan for %s=%s", key, id)
+end
+
+-- Driven from the frame callback rather than the once-a-second tick: a plan is
+-- well over a megabyte, and at 30 fps this walks through it in a fraction of a
+-- second.  Every step is non-blocking, so no single frame waits for the network.
+local function simbrief_pump()
+    if simbrief.status ~= "fetching" then return end
+
+    if os.time() - simbrief.started > SB_TIMEOUT then
+        simbrief_fail("SimBrief did not answer within %d s", SB_TIMEOUT)
+        return
+    end
+
+    if simbrief.stage == "connect" then
+        local sock = socket.tcp()
+        if not sock then
+            simbrief_fail("could not open a socket")
+            return
+        end
+        sock:settimeout(0)
+        simbrief.sock = sock
+        -- The name lookup inside connect() is the one step here that can block.
+        -- The OS resolver caches it, so it costs anything only on the first
+        -- fetch after X-Plane starts, and then only milliseconds.
+        local ok, err = sock:connect(SB_HOST, SB_PORT)
+        if ok then
+            simbrief.stage = "send"
+        elseif err == "timeout" or err == "Operation already in progress" then
+            simbrief.stage = "connecting"
+        else
+            simbrief_fail("cannot reach %s (%s)", SB_HOST, tostring(err))
+        end
+        return
+    end
+
+    if simbrief.stage == "connecting" then
+        -- Deliberately NOT socket.select(): its own manual warns that "a known
+        -- bug in WinSock causes select to fail on non-blocking TCP sockets" and
+        -- that it "may return a socket as writable even though the socket is not
+        -- ready for sending" - and Windows is the platform this runs on most.
+        -- getpeername() has no such caveat: it answers only once the connection
+        -- really stands, and nil until then.
+        if simbrief.sock:getpeername() then
+            simbrief.stage = "send"
+        elseif os.time() - simbrief.started > SB_CONNECT_TIMEOUT then
+            simbrief_fail("cannot reach %s - is the network up?", SB_HOST)
+        end
+        return
+    end
+
+    if simbrief.stage == "send" then
+        -- The request is a couple of hundred bytes and goes in one piece in
+        -- practice, but a partial send is legal and is resumed from where it got.
+        local sent, err, last = simbrief.sock:send(simbrief.request, simbrief.sent + 1)
+        if sent then
+            simbrief.sent = sent
+            if sent >= #simbrief.request then simbrief.stage = "receive" end
+        elseif err == "timeout" then
+            simbrief.sent = last or simbrief.sent
+        else
+            simbrief_fail("could not send the request (%s)", tostring(err))
+        end
+        return
+    end
+
+    -- Belt and braces: a Lua error in a callback stops the whole FlyWithLua
+    -- engine, so an unexpected state ends the fetch instead of indexing nil.
+    if simbrief.stage ~= "receive" or not simbrief.sock then
+        simbrief_fail("the fetch lost its way (stage %s)", tostring(simbrief.stage))
+        return
+    end
+
+    local data, err, partial = simbrief.sock:receive(SB_READ_CHUNK)
+    local piece = data or partial
+    if piece and #piece > 0 then
+        simbrief.nbuf = simbrief.nbuf + #piece
+        simbrief.buf[#simbrief.buf + 1] = piece
+        if simbrief.nbuf > SB_MAX_BYTES then
+            simbrief_fail("the answer was far too large to be a flight plan")
+            return
+        end
+    end
+
+    if err == "closed" then
+        -- Connection: close means the end of the connection is the end of the
+        -- body: everything collected is the answer.
+        local raw = table.concat(simbrief.buf)
+        simbrief_close()
+        if raw == "" then
+            simbrief_fail("SimBrief closed the connection without answering")
+        else
+            simbrief_finish(raw)
+        end
+    elseif err and err ~= "timeout" then
+        simbrief_fail("the connection broke (%s)", tostring(err))
+    end
 end
 
 -- Only ever called from the confirmation button.  A plan that is still loaded
@@ -1975,6 +1993,11 @@ local freeze_accum = FREEZE_CHECK_FRAMES
 local frozen_cached = nil
 
 local function frame_body()
+    -- Before every guard below.  A fetch is asked for on the ground, often with
+    -- the sim paused, and it has nothing to do with flight state - the pause
+    -- must not leave it half-finished with a socket open.
+    simbrief_pump()
+
     -- Clocks.  Both stop while the sim is paused or replaying, otherwise the
     -- announcer would "play" through a pause and come out of it mid-sentence.
     local t     = sim_time()
@@ -2032,7 +2055,6 @@ local function frame_body()
 end
 
 local function tick_body()
-    simbrief_poll()      -- before the F guard: a fetch may be pending on the ground
     if not F then return end
     read_sim()
 
@@ -2917,10 +2939,8 @@ XA_DEBUG = {
     sb_parse = simbrief_parse,
     sb_id    = simbrief_id,
     sb_start = simbrief_start,
-    sb_script  = function() return SB_SCRIPT end,
-    sb_err     = function() return SB_ERR end,
-    sb_windows = function() return IS_WINDOWS end,
-    is_windows = detect_windows,
+    sb_pump    = function() return simbrief_pump() end,
+    sb_request = function() return simbrief.request end,
     library  = function() return library end,
     state    = function() return F end,
     queue    = function() return queue, now_playing, music end,

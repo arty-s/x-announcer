@@ -25,7 +25,9 @@ nothing to re-encode. If you already keep a library from the MSFS side (say
 |---|---|
 | X-Plane | 12 |
 | [FlyWithLua NG+](https://forums.x-plane.org/index.php?/files/file/82888-flywithlua-ng-next-generation-plus-edition-for-x-plane-12-win-lin-mac/) | **2.8.9 or newer** — earlier builds have no FMOD access |
-| curl | only for the optional SimBrief lookup; ships with Windows 10+, macOS and Linux, and PowerShell (Windows) or wget (elsewhere) stands in if it is missing |
+
+Nothing else. The optional SimBrief lookup uses LuaSocket, which is built into
+FlyWithLua itself — no curl, no external tools, no scratch files.
 
 Audio goes through X-Plane's own FMOD, so `.ogg`, `.wav`, `.mp3` and `.flac`
 all play without external codecs, and the volume obeys the simulator's sound

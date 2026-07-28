@@ -213,10 +213,9 @@ SimBrief pilot ID or username
         your numeric Pilot ID or your SimBrief account name.  The Pilot ID
         is in your account settings on simbrief.com.  Save to remember it.
 Fetch latest plan
-        ask for your most recent plan.  A separate process does the download,
-        so the simulator never waits for the answer; it usually takes a
-        second.  Starting that process can cost one brief stutter - that is
-        Windows creating a process, and Lua has no way around it.
+        ask for your most recent plan.  The plugin downloads it itself, a
+        piece per frame, so the simulator never waits and never stutters;
+        the answer usually takes a second or two.
 
 Nothing is applied on its own.  The plugin shows what it found and waits:
 
@@ -236,16 +235,21 @@ Dismiss             throw it away and change nothing
 
 To go back to automatic detection: Library tab, Airline > Auto.
 
-What does the downloading.  curl is tried first - it ships with Windows 10
-build 1803 and later, with macOS, and with every desktop Linux.  If curl is
-not there, the plugin tries again with something that always is: PowerShell on
-Windows, wget on macOS and Linux.  If neither worked the status line says so -
-"download failed - no curl or PowerShell, or the network is down" - instead of
-leaving you with a bare "no answer".
+What does the downloading.  Nothing external: sockets (LuaSocket) are built
+into FlyWithLua itself, so the plugin fetches the plan on its own.  No curl,
+no PowerShell, no scratch files in the plugin folder - all of that was needed
+up to 1.1.2 and is gone.
 
-The request always goes over HTTPS.  The SimBrief API does answer over plain
-http, and some other scripts use it that way, but that would put your Pilot ID
-and your whole flight plan on the wire in the clear.
+The request goes over plain http rather than https.  Not out of laziness:
+FlyWithLua carries no TLS at all - no ssl module and no binary half of one,
+checked against what the plugin actually ships.  The SimBrief API answers over
+http quite happily (the well-known vatsimbrief-helper script works the same
+way).  The price is that your Pilot ID and your flight plan travel in the
+clear, which was judged acceptable for a flight plan.
+
+When something does go wrong the status line names it - "cannot reach
+www.simbrief.com", "SimBrief answered 503", "SimBrief did not answer within
+25 s" - rather than leaving you with a bare "no answer".
 
 
 MESSAGES UNDER THE PHASE NAME

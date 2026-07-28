@@ -1,7 +1,8 @@
 # Written by the plugin at runtime, holds the user's own settings
 x_announcer/config.ini
 
-# SimBrief scratch files
+# SimBrief scratch files, written by versions up to 1.1.2 and cleaned up on
+# load by later ones.  Kept here so an old working copy stays tidy.
 x_announcer/simbrief.json
 x_announcer/simbrief.part
 x_announcer/simbrief.err

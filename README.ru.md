@@ -25,7 +25,9 @@
 |---|---|
 | X-Plane | 12 |
 | [FlyWithLua NG+](https://forums.x-plane.org/index.php?/files/file/82888-flywithlua-ng-next-generation-plus-edition-for-x-plane-12-win-lin-mac/) | **2.8.9 и новее** (нужен FMOD-звук) |
-| curl | только для необязательного запроса в SimBrief; есть в Windows 10+, macOS и Linux, а если его нет — подменяется PowerShell (Windows) или wget (остальные) |
+
+Больше ничего. Необязательный запрос в SimBrief идёт через LuaSocket, который
+встроен в сам FlyWithLua — ни curl, ни внешних программ, ни временных файлов.
 
 Звук идёт через собственный FMOD X-Plane, поэтому играются `.ogg`, `.wav`,
 `.mp3` и `.flac` без внешних кодеков, а громкость подчиняется звуковым
