@@ -241,9 +241,14 @@ pip install lupa
 python tests/sim_test.py "D:\UA_Sounds"
 ```
 
-88 checks covering the phase machine, the audio queue, pause and time
+120 checks covering the phase machine, the audio queue, pause and time
 acceleration, config round-trips, airline detection against real livery folder
-names, SimBrief parsing, and the failure modes that can silence the plugin.
+names, the phase widget, and the failure modes that can silence the plugin.
+
+The SimBrief fetch is walked by a scriptable fake socket: an immediate connect
+and a slow one, a partial send, an answer arriving 64 bytes at a time, a close
+that carries the last piece and one that does not, six ways the request can
+fail, an oversized answer, both timeouts, and a CRLF pasted into the pilot ID.
 
 ## Credits
 
