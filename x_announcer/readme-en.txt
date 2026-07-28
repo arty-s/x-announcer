@@ -236,8 +236,16 @@ Dismiss             throw it away and change nothing
 
 To go back to automatic detection: Library tab, Airline > Auto.
 
-Requires curl, which ships with Windows 10 and 11, macOS and Linux.  If it
-is missing you will see a message saying no answer arrived.
+What does the downloading.  curl is tried first - it ships with Windows 10
+build 1803 and later, with macOS, and with every desktop Linux.  If curl is
+not there, the plugin tries again with something that always is: PowerShell on
+Windows, wget on macOS and Linux.  If neither worked the status line says so -
+"download failed - no curl or PowerShell, or the network is down" - instead of
+leaving you with a bare "no answer".
+
+The request always goes over HTTPS.  The SimBrief API does answer over plain
+http, and some other scripts use it that way, but that would put your Pilot ID
+and your whole flight plan on the wire in the clear.
 
 
 MESSAGES UNDER THE PHASE NAME

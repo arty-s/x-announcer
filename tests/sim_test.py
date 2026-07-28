@@ -1112,13 +1112,46 @@ def scenario_simbrief_launch(library):
         check("curl.exe" in body and "move /y" in body, "cmd.exe syntax is used")
         check("\\simbrief.part" in body and "\\simbrief.json" in body,
               "move gets backslash paths, which is what cmd.exe understands")
+        # curl ships with Windows 10 1803 and later, but that is not a promise:
+        # PowerShell is the second try so a missing curl is not a dead end.
+        check("powershell" in body and "DownloadFile" in body,
+              "PowerShell is the fallback when curl is missing")
+        check("Tls12" in body, "the fallback is pinned to TLS 1.2, not whatever is default")
     else:
         check(body.startswith("#!/bin/sh"), "a shell script is written")
-        check("curl " in body and " && mv " in body, "sh syntax is used")
+        check("curl " in body and "mv " in body, "sh syntax is used")
+        check("wget " in body, "wget is the fallback when curl is missing")
+    check(body.count("https://www.simbrief.com") >= 1 and "http://" not in body,
+          "every download path uses https, never plain http")
     check("simbrief.com" in body and "userid=123456" in body,
           "the request goes to SimBrief with the configured pilot ID")
     check(" -L" not in body and "--max-filesize" in body,
           "redirects stay off and the answer size stays capped")
+    check("simbrief.err" in body,
+          "the script leaves a marker when no downloader worked")
+
+    # A failed download must say so rather than time out into a guess.
+    err_path = g.XA_DEBUG.sb_err()
+    with open(err_path, "w", encoding="utf-8") as f:
+        f.write("failed\n")
+    g.xa_tick()
+    sb = g.XA_DEBUG.simbrief()
+    print("      message:  %s" % sb.message)
+    check(sb.status == "error" and "download failed" in sb.message,
+          "the marker turns into a plain explanation, not 'no answer'")
+    check(not os.path.exists(err_path), "the marker is cleared once it is read")
+
+    # The fallbacks have no --max-filesize, so the cap is enforced here as well.
+    lua.execute("XA_DEBUG.simbrief().status = 'fetching' "
+                "XA_DEBUG.simbrief().pending = nil")
+    with open(g.XA_DEBUG.sb_script().replace("simbrief_fetch.cmd", "simbrief.json")
+              .replace("simbrief_fetch.sh", "simbrief.json"), "wb") as f:
+        f.write(b"x" * (9 * 1024 * 1024))
+    g.xa_tick()
+    sb = g.XA_DEBUG.simbrief()
+    print("      message:  %s" % sb.message)
+    check(sb.status == "error" and "too large" in sb.message,
+          "an oversized answer is refused instead of being read into memory")
 
     shutil.rmtree(tmp, ignore_errors=True)
 

@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.1.1"
+local VERSION = "1.1.2"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -1679,6 +1679,7 @@ end
 local SB_ENDPOINT = "https://www.simbrief.com/api/xml.fetcher.php?json=1&"
 local SB_OUT      = BASE_DIR .. "simbrief.json"
 local SB_PART     = BASE_DIR .. "simbrief.part"
+local SB_ERR      = BASE_DIR .. "simbrief.err"
 local SB_SCRIPT   = BASE_DIR .. (IS_WINDOWS and "simbrief_fetch.cmd" or "simbrief_fetch.sh")
 local SB_TIMEOUT  = 25
 local SB_MAX_BYTES = 8 * 1024 * 1024   -- a full OFP with navlog is well under this
@@ -1704,6 +1705,16 @@ local function read_file(path)
     local data = f:read("*a")
     f:close()
     return data
+end
+
+-- Asked before reading: curl is told --max-filesize, but the fallbacks have no
+-- equivalent, so the cap is enforced on this side too rather than trusted.
+local function file_size(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local n = f:seek("end")
+    f:close()
+    return n
 end
 
 -- A scoped reader rather than a JSON parser.  SimBrief repeats key names across
@@ -1783,6 +1794,7 @@ local function simbrief_start()
 
     os.remove(SB_OUT)
     os.remove(SB_PART)
+    os.remove(SB_ERR)
 
     -- SimBrief takes either the numeric pilot id or the account name
     local key = id:match("^%d+$") and "userid" or "username"
@@ -1797,21 +1809,47 @@ local function simbrief_start()
         return
     end
     -- Download to a scratch name and rename on success, so the poller can never
-    -- read a half-written file.
+    -- read a half-written file.  If nothing here manages the download, the
+    -- script leaves a marker file behind: without it the panel can only say
+    -- "no answer", which is true of a missing tool and of a dead network alike.
+    --
+    -- curl is the first choice everywhere - it is in Windows since 10 1803, in
+    -- macOS since 10.1, and in every desktop Linux - but it is not a law of
+    -- nature, so each platform gets a second try with something that is:
+    -- PowerShell on Windows, wget on the rest.  In-process HTTP was considered
+    -- and rejected: FlyWithLua's LuaSocket has no TLS at all, so it could only
+    -- reach SimBrief over plain http, and its socket calls block the simulator
+    -- thread for the whole download.
+    --
     -- No -L on purpose: without it curl will not follow a redirect somewhere
     -- else, so the request can only ever reach simbrief.com.  --max-filesize
-    -- keeps a runaway answer from being read into memory whole.
+    -- keeps a runaway answer from being read into memory whole; the fallbacks
+    -- have no such switch, which is why the poller checks the size as well.
     local args = string.format('-s --max-filesize %d -m %d', SB_MAX_BYTES, SB_TIMEOUT)
     if IS_WINDOWS then
+        local part, out = shell_path(SB_PART), shell_path(SB_OUT)
+        -- Single quotes are what PowerShell reads literally, so a path
+        -- containing one is escaped the way PowerShell wants: by doubling it.
+        local ps_part = part:gsub("'", "''")
         f:write("@echo off\r\n")
-        f:write(string.format('curl.exe %s -o "%s" "%s"\r\n',
-                              args, shell_path(SB_PART), url))
-        f:write(string.format('if not errorlevel 1 move /y "%s" "%s"\r\n',
-                              shell_path(SB_PART), shell_path(SB_OUT)))
+        f:write(string.format('curl.exe %s -o "%s" "%s"\r\n', args, part, url))
+        f:write("if not errorlevel 1 goto xa_done\r\n")
+        f:write(string.format('powershell -NoProfile -ExecutionPolicy Bypass -Command '
+            .. '"try{[Net.ServicePointManager]::SecurityProtocol='
+            .. '[Net.SecurityProtocolType]::Tls12;(New-Object Net.WebClient)'
+            .. ".DownloadFile('%s','%s')}catch{exit 1}\"\r\n", url, ps_part))
+        f:write("if not errorlevel 1 goto xa_done\r\n")
+        f:write(string.format('> "%s" echo failed\r\n', shell_path(SB_ERR)))
+        f:write("goto xa_end\r\n")
+        f:write(string.format(':xa_done\r\nmove /y "%s" "%s"\r\n:xa_end\r\n', part, out))
     else
         f:write("#!/bin/sh\n")
-        f:write(string.format('curl %s -o "%s" "%s" && mv "%s" "%s"\n',
+        f:write(string.format('if curl %s -o "%s" "%s"; then mv "%s" "%s"\n',
                               args, SB_PART, url, SB_PART, SB_OUT))
+        f:write(string.format('elif wget -q -T %d -O "%s" "%s"; then mv "%s" "%s"\n',
+                              SB_TIMEOUT, SB_PART, url, SB_PART, SB_OUT))
+        f:write(string.format('else rm -f "%s"; echo failed > "%s"; fi\n',
+                              SB_PART, SB_ERR))
     end
     f:close()
 
@@ -1841,11 +1879,32 @@ local function simbrief_poll()
         return
     end
 
+    -- The download script says so itself when neither tool worked, which beats
+    -- waiting out the timeout and then guessing at the reason.
+    if file_size(SB_ERR) then
+        os.remove(SB_ERR)
+        simbrief.status  = "error"
+        simbrief.message = IS_WINDOWS
+            and "download failed - no curl or PowerShell, or the network is down"
+            or  "download failed - no curl or wget, or the network is down"
+        log("simbrief: %s", simbrief.message)
+        return
+    end
+
+    local size = file_size(SB_OUT)
+    if size and size > SB_MAX_BYTES then
+        os.remove(SB_OUT)
+        simbrief.status  = "error"
+        simbrief.message = "the answer was far too large to be a flight plan"
+        log("simbrief: %s (%d bytes)", simbrief.message, size)
+        return
+    end
+
     local raw = read_file(SB_OUT)
     if not raw then
         if os.time() - simbrief.started > SB_TIMEOUT + 10 then
             simbrief.status  = "error"
-            simbrief.message = "no answer - is curl installed and the network up?"
+            simbrief.message = "no answer - is the network up?"
             log("simbrief: %s", simbrief.message)
         end
         return
@@ -2859,6 +2918,7 @@ XA_DEBUG = {
     sb_id    = simbrief_id,
     sb_start = simbrief_start,
     sb_script  = function() return SB_SCRIPT end,
+    sb_err     = function() return SB_ERR end,
     sb_windows = function() return IS_WINDOWS end,
     is_windows = detect_windows,
     library  = function() return library end,

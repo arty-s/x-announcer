@@ -4,6 +4,7 @@ x_announcer/config.ini
 # SimBrief scratch files
 x_announcer/simbrief.json
 x_announcer/simbrief.part
+x_announcer/simbrief.err
 x_announcer/simbrief_fetch.cmd
 x_announcer/simbrief_fetch.sh
 
