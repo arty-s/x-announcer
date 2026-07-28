@@ -1,0 +1,18 @@
+# Written by the plugin at runtime, holds the user's own settings
+x_announcer/config.ini
+
+# SimBrief scratch files
+x_announcer/simbrief.json
+x_announcer/simbrief.part
+x_announcer/simbrief_fetch.cmd
+x_announcer/simbrief_fetch.sh
+
+# Sound packs are not ours to ship
+x_announcer/Sounds/
+
+# Build output
+dist/
+*.zip
+
+__pycache__/
+*.pyc
