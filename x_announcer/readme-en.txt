@@ -101,7 +101,18 @@ Reset flight      start the cycle over for a new flight
 
 PHASES (the ladder at the bottom of the Flight tab)
 ---------------------------------------------------
-Preflight         waiting for power and cabin lights
+Preflight         waiting for the aircraft to wake up: ANY ONE of four
+                  will do - battery, navigation, taxi or logo lights (the
+                  last only if your add-on publishes one).  Next to the
+                  condition is what the plugin can see right now: "no
+                  battery/nav/taxi" when it sees nothing, "nav" when the
+                  navigation lights did it.  It is written that way
+                  because study-level add-ons run their own electrical
+                  system and often never drive X-Plane's generic battery
+                  dataref - on a ToLiss the battery reads off with the
+                  aircraft powered up, and NAV & LOGO is what moves.
+                  If your aircraft drives none of the four, boarding can
+                  always be started with the Start boarding button
 Boarding          boarding, welcomes and music
 Doors & safety    doors to automatic, safety briefing
 Takeoff           crew seated, cabin secure

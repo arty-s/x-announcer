@@ -242,9 +242,30 @@ def build_runtime(sim, library, config_extra="", livery_path=""):
         end
     """)
 
-    # minimal imgui stub so the UI builder can be exercised
+    # An imgui stub that refuses to invent functions.  FlyWithLua binds only part
+    # of ImGui and does not document which part, so a stub answering every name
+    # with a callable hides the difference between "this works" and "this is nil
+    # in the simulator".  It hid exactly that once: imgui.SetTooltip does not
+    # exist in FlyWithLua 2.8.13, and opening the widget density list took the
+    # whole panel down while the bench stayed green.
+    #
+    # Everything below has been seen to render in X-Plane.  Adding a name here
+    # is a claim that it is really bound - check before you do.
     lua.execute("""
         local calls = {}
+        local BOUND = {}
+        for _, name in ipairs({
+            "BeginTabBar", "EndTabBar", "BeginTabItem", "EndTabItem",
+            "BeginChild", "EndChild", "BeginTable", "EndTable",
+            "TableSetupColumn", "TableHeadersRow", "TableNextRow", "TableNextColumn",
+            "BeginCombo", "EndCombo", "Selectable",
+            "Button", "SmallButton", "Checkbox", "InputText",
+            "SliderFloat", "SliderInt", "ProgressBar",
+            "TextUnformatted", "Separator", "Dummy", "SameLine",
+            "PushStyleColor", "PopStyleColor", "PushID", "PopID",
+            "SetNextItemWidth", "SetWindowFontScale", "IsItemHovered",
+        }) do BOUND[name] = true end
+
         local returns = {
             Begin = true, BeginChild = true, BeginCombo = false, BeginTabBar = true,
             BeginTabItem = true, BeginTable = true, Button = false, SmallButton = false,
@@ -252,6 +273,10 @@ def build_runtime(sim, library, config_extra="", livery_path=""):
         }
         CLICK_EVERYTHING = false
         local stub = setmetatable({}, { __index = function(_, key)
+            if not BOUND[key] then
+                error("imgui." .. tostring(key) .. " is not bound by FlyWithLua - "
+                      .. "calling it takes the panel down in the simulator", 2)
+            end
             return function(...)
                 calls[#calls + 1] = key
                 if key == "InputText" or key == "SliderFloat"
@@ -632,6 +657,19 @@ def scenario_ui_clicks(library):
     lua.globals().xa_build_ui()
 
     check(True, "no Lua error with every widget activated")
+
+    # The bench used to answer any imgui.* name with a callable, so a function
+    # FlyWithLua does not bind looked fine here and killed the panel in the
+    # simulator - imgui.SetTooltip did exactly that.  Prove the tripwire is live.
+    # pcall returns two values on failure; keep only the flag.
+    tripped = lua.eval("function() local ok = pcall(function() "
+                       "imgui.SetTooltip('x') end) return ok end")()
+    check(tripped is False,
+          "an imgui function FlyWithLua does not bind is refused by the bench")
+    still_fine = lua.eval("function() local ok = pcall(function() "
+                          "imgui.TextUnformatted('x') end) return ok end")()
+    check(still_fine is True, "and the ones it does bind still work")
+
     print("      config after clicking:",
           lua.eval("function() local c = XA_DEBUG.config "
                    "return string.format('bus=%s music=%s vol=%.2f', "
@@ -1289,8 +1327,35 @@ def scenario_widget(library):
     print("      " + "\n      ".join(lines))
     check(any(l.startswith("accent|PREFLIGHT") for l in lines),
           "the phase leads the widget")
-    check(any("cabin power on" in l for l in lines),
+    check(any("battery or any light on" in l for l in lines),
           "the missing condition is named")
+    # The condition is satisfied by any of four things, so it has to say which
+    # ones it is watching - "cabin power on" sent one user hunting for a cabin
+    # switch when what his ToLiss needed was the nav lights.
+    check(any("no battery/nav/taxi" in l for l in lines),
+          "and it names what it is actually watching, not a vague 'cabin power'")
+
+    # A study-level add-on may never drive X-Plane's generic battery dataref, so
+    # nav lights alone have to be enough.  Held in Preflight first, to see the
+    # line itself; then released, to see the phase actually move.
+    lua.execute("XA_DEBUG.config.auto_boarding = false")
+    sim.set(nav=1)
+    advance(lua, sim, 2)
+    power_line = [l for l in widget_text(lua) if "battery or any light" in l]
+    print("      with only nav lights on: %s" % (power_line[0] if power_line else "-"))
+    check(bool(power_line) and power_line[0].startswith("ok|v"),
+          "nav lights alone wake the aircraft up, no battery needed")
+    check(bool(power_line) and power_line[0].rstrip().endswith("nav"),
+          "and the panel says which one it saw")
+
+    lua.execute("XA_DEBUG.config.auto_boarding = true")
+    advance(lua, sim, 3)
+    check(lua.globals().XA_DEBUG.state().phase == "BOARDING",
+          "and boarding really does start on the lights alone")
+
+    sim.set(nav=0)
+    lua.execute("XA_DEBUG.config.auto_boarding = false")
+    advance(lua, sim, 2)
 
     # The condition list must not drift from the state machine: whenever every
     # condition reads as met, the phase is expected to move on.

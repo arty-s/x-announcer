@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.1.3"
+local VERSION = "1.1.4"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -1222,7 +1222,7 @@ end
 ----------------------------------------------------------------------------
 
 local PHASES = {
-    { id = "PREFLIGHT",  label = "Preflight",     hint = "waiting for cabin power / lights" },
+    { id = "PREFLIGHT",  label = "Preflight",     hint = "waiting for the battery or any exterior light" },
     { id = "BOARDING",   label = "Boarding",      hint = "beacon ON ends boarding" },
     { id = "PUSHBACK",   label = "Doors & safety",hint = "engine start arms the doors" },
     { id = "TAKEOFF",    label = "Takeoff",       hint = "strobes/landing lights = crew seats" },
@@ -1283,12 +1283,34 @@ local function finished(event, extra_delay)
     return sim_clock >= t + (extra_delay or 0)
 end
 
+-- "Is the aeroplane awake yet?"  Deliberately generous, and deliberately not
+-- called cabin power: study-level add-ons run their own electrical system and
+-- many never drive X-Plane's generic battery dataref, so on a ToLiss the battery
+-- reads off with the aircraft fully powered up and the nav lights are what
+-- actually moves.  Any one of these counts, and the panel names which ones are
+-- seen - being told "cabin power on" while the cabin is plainly powered is worse
+-- than a slightly longer line.
+local POWER_SIGNS = {
+    { name = "battery", read = function(s) return s.battery end },
+    { name = "nav",     read = function(s) return s.nav_lights end },
+    { name = "logo",    read = function(s) return s.logo end },
+    { name = "taxi",    read = function(s) return s.taxi_light end },
+}
+
+local function aircraft_powered(s)
+    local on = {}
+    for _, sign in ipairs(POWER_SIGNS) do
+        if sign.read(s) then on[#on + 1] = sign.name end
+    end
+    return #on > 0, on
+end
+
 local function state_machine()
     local s = sim
 
     -- ---------------------------------------------------------------- ground
     if F.phase == "PREFLIGHT" then
-        local power = s.battery or s.nav_lights or s.logo or s.taxi_light
+        local power = aircraft_powered(s)
         if s.on_ground and s.all_engines_off and not s.beacon and s.gs_kt < 1 then
             if cfg.auto_boarding and power then
                 F.boarding_open = true
@@ -1489,12 +1511,30 @@ local function phase_conditions()
     local p = F.phase
 
     if p == "PREFLIGHT" then
-        local power = s.battery or s.nav_lights or s.logo or s.taxi_light
+        -- The value column carries the diagnosis: which of the four the plugin
+        -- can see, or - when it sees none - which ones it is watching.  On an
+        -- aircraft whose battery switch never reaches X-Plane that is the
+        -- difference between "flip the nav lights" and "the plugin is broken".
+        local powered, on = aircraft_powered(s)
+        local reading
+        if powered then
+            reading = table.concat(on, " + ")
+        else
+            local watched = {}
+            for _, sign in ipairs(POWER_SIGNS) do
+                -- Only add-ons publish a logo light; do not name one that is
+                -- not there to be switched.
+                if sign.name ~= "logo" or logo_dref then
+                    watched[#watched + 1] = sign.name
+                end
+            end
+            reading = "no " .. table.concat(watched, "/")
+        end
         return "Boarding", {
             yes("on the ground",   s.on_ground),
             yes("engines off",     s.all_engines_off),
             yes("beacon off",      not s.beacon),
-            yes("cabin power on",  power),
+            yes("battery or any light on", powered, reading),
         }
     elseif p == "BOARDING" then
         return "Doors & safety", {
@@ -2515,9 +2555,18 @@ local function draw_settings_tab()
                 cfg.widget_mode = mode.id
                 config_save()
             end
-            if imgui.IsItemHovered() then imgui.SetTooltip(mode.hint) end
         end
         imgui.EndCombo()
+    end
+    -- The hint used to be a tooltip on each entry.  FlyWithLua does not bind
+    -- imgui.SetTooltip at all, and calling it took the whole panel down the
+    -- moment this list was opened.  On the line it is anyway: a hint nobody has
+    -- to hover to find is the better one.
+    for _, mode in ipairs(WIDGET_MODES) do
+        if mode.id == cfg.widget_mode then
+            imgui.SameLine()
+            text_col(COL.dim, "  " .. mode.hint)
+        end
     end
 
     imgui.SetNextItemWidth(200)
