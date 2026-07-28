@@ -762,6 +762,52 @@ def scenario_regressions(library):
           "ambience stops after touchdown (background now: %s)" % still_playing)
     shutil.rmtree(tmp, ignore_errors=True)
 
+    # --- a missing file must not stall the phase ----------------------------
+    # Both the takeoff and the disembark transitions used to be gated on the
+    # announcement actually going on the air.  A pack without DisembarkStarted
+    # therefore parked the machine in TAXI_IN forever - and since the turnaround
+    # reset lives in DISEMBARK, every announcement stayed marked as heard and the
+    # next flight of the session said nothing at all.
+    empty = tempfile.mkdtemp(prefix="xa_empty_lib_")
+    os.makedirs(os.path.join(empty, "TST"))
+    sim = Sim()
+    lua, tmp = build_runtime(
+        sim, empty, "airline_mode = manual\nairline_manual = TST\nauto_find = false\n")
+    run_script(lua)
+
+    def phase():
+        return lua.eval("function() return XA_DEBUG.state().phase end")()
+
+    sim.set(battery=1, nav=1)
+    advance(lua, sim, 10)
+    sim.set(beacon=1, engines=True, parkbrake=0.0)
+    advance(lua, sim, 20)
+    sim.set(strobe=1)
+    advance(lua, sim, 10)
+    check(phase() == "TAKEOFF",
+          "line-up moves the phase with no file to play (phase: %s)" % phase())
+
+    sim.set(on_ground=0, agl_m=1500, alt_ft=6000, vs_fpm=2000, gs_ms=120)
+    advance(lua, sim, 30)
+    sim.set(alt_ft=35000, agl_m=10000, vs_fpm=0)
+    advance(lua, sim, 60)
+    sim.set(alt_ft=9000, agl_m=2500, vs_fpm=-1200)
+    advance(lua, sim, 40)
+    sim.set(agl_m=600, alt_ft=2500, vs_fpm=-700)
+    advance(lua, sim, 30)
+    sim.set(on_ground=1, agl_m=0, gs_ms=15, vs_fpm=0)
+    advance(lua, sim, 30)
+    sim.set(gs_ms=0, engines=False, parkbrake=1.0, beacon=0)
+    advance(lua, sim, 60)
+    check(phase() == "DISEMBARK",
+          "disembarking starts with no file to play (phase: %s)" % phase())
+
+    advance(lua, sim, 130)
+    check(phase() == "BOARDING",
+          "the turnaround still resets for the next flight (phase: %s)" % phase())
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(empty, ignore_errors=True)
+
     # --- skipping an announcement must not block the chain behind it --------
     sim = Sim()
     lua, tmp = build_runtime(

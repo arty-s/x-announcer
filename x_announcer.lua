@@ -1370,7 +1370,12 @@ local function state_machine()
             once("CabinDimTakeoff", "night departure")
         end
         if s.on_ground and s.any_engine and (s.strobe or s.landing_light) then
-            if once("CrewSeatsTakeoff", "lined up") then set_phase("TAKEOFF") end
+            -- The phase moves whether or not there is a file to play.  Until
+            -- 2026-07-28 this and the disembark transition were gated on the
+            -- announcement actually going on the air, so a pack missing one file
+            -- stalled the machine - harmless here, but fatal on the stand.
+            once("CrewSeatsTakeoff", "lined up")
+            set_phase("TAKEOFF")
         end
         if not s.on_ground then set_phase("TAKEOFF") end
     end
@@ -1469,7 +1474,12 @@ local function state_machine()
         if s.all_engines_off and (s.parkbrake or s.gs_kt < 1) then
             if cfg.door_calls then once("DisarmDoors", "on stand") end
             if (not cfg.door_calls or finished("DisarmDoors")) and not s.beacon then
-                if once("DisembarkStarted", "doors open") then set_phase("DISEMBARK") end
+                -- This is the one that mattered: the turnaround reset lives in
+                -- DISEMBARK, so a pack without this file left the machine parked
+                -- in TAXI_IN with every announcement marked as already heard,
+                -- and the next flight of the session said nothing at all.
+                once("DisembarkStarted", "doors open")
+                set_phase("DISEMBARK")
             end
         end
     end
