@@ -731,19 +731,41 @@ local GENERIC_NAMES = {
 }
 
 do
-    for icao, entry in pairs(airlines) do
-        local full = normalise(entry.n)
-        if #full >= 4 and not GENERIC_NAMES[full] and not name_index[full] then
-            name_index[full] = icao
+    -- Two carriers can want the same key: strip "airlines" from "Japan Airlines"
+    -- and "air" from "Air Japan" and both ask for "japan".  Whoever gets it used
+    -- to be decided by `pairs()`, which is hash order - so the answer for a
+    -- Japanese livery depended on the build.  Sorting name_list below fixed only
+    -- half of that; this is the other half.
+    --
+    -- The rule: the key goes to the carrier whose full name STARTS with it, which
+    -- is what an abbreviation is - "Japan Airlines" shortens to "Japan", "Air
+    -- Japan" does not.  When neither or both qualify the lower ICAO wins, which
+    -- is arbitrary but identical on every machine.
+    local name_owner = {}
+
+    local function claim(key, icao, full)
+        if #key < 4 or GENERIC_NAMES[key] then return end
+        local owner = name_owner[key]
+        if not owner then
+            name_index[key], name_owner[key] = icao, full
+        elseif full:sub(1, #key) == key and owner:sub(1, #key) ~= key then
+            name_index[key], name_owner[key] = icao, full
         end
+    end
+
+    local codes = {}
+    for icao in pairs(airlines) do codes[#codes + 1] = icao end
+    table.sort(codes)
+
+    for _, icao in ipairs(codes) do
+        local full = normalise(airlines[icao].n)
+        claim(full, icao, full)
 
         local short = full
         for _, word in ipairs(STRIP_WORDS) do
             short = short:gsub(word, "")
         end
-        if #short >= 4 and not GENERIC_NAMES[short] and not name_index[short] then
-            name_index[short] = icao
-        end
+        claim(short, icao, full)
     end
     for alias, icao in pairs(ALIASES) do name_index[alias] = icao end
     for norm, icao in pairs(name_index) do

@@ -1108,9 +1108,17 @@ def scenario_livery_detection(library):
 
     # The defect Artyom hit: S7 is recognised, we own no S7 pack, and that used
     # to be reported as "not detected" instead of "detected, no pack".
-    code, pack, _ = resolve_livery(library, "[CFMLEAP] S7 AIRLINES RA-73466")
+    #
+    # The library here is a fixture ON PURPOSE. This check used to run against
+    # whatever packs happened to sit on the machine, and it flipped from pass to
+    # fail the moment an S7 pack was added to the real library - the code was
+    # fine, the assumption behind the check had simply expired. A check whose
+    # verdict depends on the contents of somebody's disk is not a check.
+    fixture = make_fixture_library(library)
+    code, pack, _ = resolve_livery(fixture, "[CFMLEAP] S7 AIRLINES RA-73466")
     check(code == "SBI", "S7 livery is recognised as SBI")
-    check(pack == "DEFAULT", "and falls back to the Default pack for audio")
+    check(pack == "DEFAULT", "and falls back to Default when we own no S7 sounds")
+    shutil.rmtree(fixture, ignore_errors=True)
 
     # A three-letter word must never outrank the airline name next to it.
     for folder, want in (("Air China", "CCA"), ("Red Wings Airlines RA-73329", "RWZ"),
