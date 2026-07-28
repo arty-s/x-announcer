@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.1.4"
+local VERSION = "1.1.5"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
