@@ -87,7 +87,8 @@ a call, `Default` steps in.
 Supported events: `BoardingWelcome`, `BoardingWelcomePilot`, `BoardingStarted`,
 `BoardingMusic`, `BoardingComplete`, `DepartureDelayed`, `ArmDoors`,
 `PreSafetyBriefing`, `SafetyBriefing`, `CabinDimTakeoff`, `CrewSeatsTakeoff`,
-`CallCabinSecureTakeoff`, `AfterTakeoff`, `TopOfClimbPilot`, `FastenSeatbelt`,
+`CallCabinSecureTakeoff`, `AfterTakeoff`, `TopOfClimbPilot`,
+`CruiseElapsed50Percent`, `CruiseElapsed75Percent`, `FastenSeatbelt`,
 `Turbulence`, `TopOfDescentPilot`, `DescentSeatbelts`, `CabinDimLanding`,
 `BeforeLanding`, `CrewSeatsLanding`, `CallCabinSecureLanding`, `AfterLanding`,
 `AfterLandingMusic`, `DisarmDoors`, `DisembarkStarted`, `LandingGreat`,
@@ -130,6 +131,7 @@ The Flight tab always shows what was read and how it matched, e.g.
 | CabinNoise | cabin ambience in flight, independent of boarding music; off on the ground |
 | AfterLandingMusic | during deboarding, until the cycle resets |
 | BoardingComplete | beacon on, or an engine started |
+| DepartureDelayed | boarding has been running longer than `delay_after` (15 minutes by default). X-Plane knows nothing about schedules, so "we are still here" is the only delay that can honestly be observed |
 | ArmDoors | engine running / started moving |
 | PreSafetyBriefing → SafetyBriefing | in sequence, after ArmDoors |
 | CabinDimTakeoff | night, 10 s after the briefing ends |
@@ -137,6 +139,7 @@ The Flight tab always shows what was read and how it matched, e.g.
 | CallCabinSecureTakeoff | 5 s after CrewSeatsTakeoff finishes |
 | AfterTakeoff | airborne, above 3000 ft AGL (or 150 s after lift-off) |
 | TopOfClimbPilot | above 15,000 ft, vertical speed under 350 fpm for 25 s |
+| CruiseElapsed50Percent / CruiseElapsed75Percent | half and three quarters of the route flown, in the cruise. The route runs from the liftoff point to the last point of the FMS plan and is measured once, at liftoff; under 150 nm it is not marked at all, and with no plan loaded it stays silent |
 | FastenSeatbelt / Turbulence | seatbelt sign switched on in flight (180 s between triggers). Turbulence if the g-trace was rough beforehand |
 | TopOfDescentPilot | descending 500 fpm or more above 20,000 ft for 25 s |
 | DescentSeatbelts | below 10,000 ft on descent |
@@ -267,6 +270,7 @@ simulator closed, or change things in the panel — it rewrites the file itself.
 | `boarding_music` / `cabin_noise` | boarding music / cabin ambience in flight |
 | `auto_boarding` | start boarding on its own, without the button |
 | `boarding_repeat` | seconds between repeats of the welcome |
+| `delay_after` | seconds of boarding before the delay is announced; 0 never announces it |
 | `pilot_welcome` / `door_calls` / `night_dim` / `landing_reaction` | which groups of calls to play |
 | `seatbelt_dref` | your own seatbelt sign dataref |
 | `window_scale` | text size in the panel |

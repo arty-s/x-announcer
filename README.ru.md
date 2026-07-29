@@ -88,7 +88,7 @@ Control Panel**. Это единственное меню, которое FlyWit
 `BoardingStarted`, `BoardingMusic`, `BoardingComplete`, `DepartureDelayed`,
 `ArmDoors`, `PreSafetyBriefing`, `SafetyBriefing`, `CabinDimTakeoff`,
 `CrewSeatsTakeoff`, `CallCabinSecureTakeoff`, `AfterTakeoff`, `TopOfClimbPilot`,
-`FastenSeatbelt`, `Turbulence`, `TopOfDescentPilot`, `DescentSeatbelts`,
+`CruiseElapsed50Percent`, `CruiseElapsed75Percent`, `FastenSeatbelt`, `Turbulence`, `TopOfDescentPilot`, `DescentSeatbelts`,
 `CabinDimLanding`, `BeforeLanding`, `CrewSeatsLanding`, `CallCabinSecureLanding`,
 `AfterLanding`, `AfterLandingMusic`, `DisarmDoors`, `DisembarkStarted`,
 `LandingGreat`, `LandingTerrible`, `CabinNoise`.
@@ -130,6 +130,7 @@ Control Panel**. Это единственное меню, которое FlyWit
 | CabinNoise | шум салона в полёте (галка «Cabin ambience»), независимо от музыки посадки; выключается на земле |
 | AfterLandingMusic | фон во время высадки, до сброса цикла |
 | BoardingComplete | включён маяк или запущен двигатель |
+| DepartureDelayed | посадка пассажиров идёт дольше `delay_after` (по умолчанию 15 минут). Расписания X-Plane не знает, поэтому «мы всё ещё здесь» — единственная честно наблюдаемая задержка |
 | ArmDoors | двигатель работает / начали движение |
 | PreSafetyBriefing → SafetyBriefing | последовательно, после ArmDoors |
 | CabinDimTakeoff | ночь + брифинг закончился (+10 с) |
@@ -137,6 +138,7 @@ Control Panel**. Это единственное меню, которое FlyWit
 | CallCabinSecureTakeoff | через 5 с после того, как CrewSeatsTakeoff доиграл |
 | AfterTakeoff | в воздухе, выше 3000 ft AGL (или 150 с после отрыва) |
 | TopOfClimbPilot | выше 15 000 ft, вертикальная < 350 fpm 25 с подряд |
+| CruiseElapsed50Percent / CruiseElapsed75Percent | в круизе пройдена половина и три четверти маршрута. Маршрут = от точки отрыва до последней точки плана FMS, замеряется один раз при отрыве; короче 150 миль не объявляется, плана нет — молчит |
 | FastenSeatbelt / Turbulence | табло «пристегнуть ремни» включилось в полёте (пауза 180 с между срабатываниями). Turbulence — если перед этим была болтанка по перегрузке |
 | TopOfDescentPilot | снижение ≥ 500 fpm выше 20 000 ft, 25 с подряд |
 | DescentSeatbelts | ниже 10 000 ft на снижении |
@@ -267,6 +269,7 @@ Settings — это один и тот же переключатель. Плот
 | `boarding_music` / `cabin_noise` | фоновая музыка при посадке / шум салона в полёте |
 | `auto_boarding` | начинать посадку самому, без кнопки |
 | `boarding_repeat` | секунд между повторами приветствия |
+| `delay_after` | через сколько секунд посадки объявить задержку вылета; 0 — не объявлять |
 | `pilot_welcome` / `door_calls` / `night_dim` / `landing_reaction` | какие группы реплик играть |
 | `seatbelt_dref` | свой датареф табло ремней |
 | `window_scale` | масштаб текста в окне |

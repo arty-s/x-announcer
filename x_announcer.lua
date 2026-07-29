@@ -178,6 +178,7 @@ local cfg = {
     cabin_noise      = false,
     auto_boarding    = true,      -- start boarding from lights/power, else manual
     boarding_repeat  = 300,       -- seconds between BoardingWelcome repeats
+    delay_after      = 900,       -- seconds of boarding before the delay call; 0 = never
     pilot_welcome    = false,
     door_calls       = true,      -- ArmDoors / DisarmDoors
     night_dim        = true,      -- CabinDim* announcements
@@ -198,7 +199,7 @@ local CFG_ORDER = {
     "library", "language", "airline_mode", "airline_manual",
     "announce_bus", "music_bus", "volume", "music_volume", "duck",
     "enabled", "boarding_music", "cabin_noise", "auto_boarding",
-    "boarding_repeat", "pilot_welcome", "door_calls", "night_dim",
+    "boarding_repeat", "delay_after", "pilot_welcome", "door_calls", "night_dim",
     "landing_reaction", "seatbelt_dref", "window_scale", "auto_find",
     "music_max_loops", "simbrief_id",
     "widget", "widget_mode", "widget_opacity", "widget_x", "widget_y",
@@ -241,6 +242,7 @@ local CFG_HELP = {
     cabin_noise      = "фоновый шум салона в полёте, если файл CabinNoise есть в паке",
     auto_boarding    = "начинать посадку пассажиров самому по питанию и огням; false - только кнопкой",
     boarding_repeat  = "секунд между повторами приветствия при посадке",
+    delay_after      = "через сколько секунд посадки объявить задержку вылета; 0 - не объявлять",
     pilot_welcome    = "приветствие командира после приветствия бортпроводника",
     door_calls       = "объявления про двери: ArmDoors и DisarmDoors",
     night_dim        = "объявления про притушенный свет в салоне ночью",
@@ -505,7 +507,8 @@ local EVENTS = {
     "BoardingWelcome", "BoardingWelcomePilot", "BoardingStarted", "BoardingMusic",
     "BoardingComplete", "DepartureDelayed", "ArmDoors", "PreSafetyBriefing",
     "SafetyBriefing", "CabinDimTakeoff", "CrewSeatsTakeoff", "CallCabinSecureTakeoff",
-    "AfterTakeoff", "TopOfClimbPilot", "FastenSeatbelt", "Turbulence",
+    "AfterTakeoff", "TopOfClimbPilot", "CruiseElapsed50Percent", "CruiseElapsed75Percent",
+    "FastenSeatbelt", "Turbulence",
     "TopOfDescentPilot", "DescentSeatbelts", "CabinDimLanding", "BeforeLanding",
     "CrewSeatsLanding", "CallCabinSecureLanding", "AfterLanding", "AfterLandingMusic",
     "DisarmDoors", "DisembarkStarted", "LandingGreat", "LandingTerrible", "CabinNoise",
@@ -608,6 +611,27 @@ local function scan_pack(pack_path, pack)
     if chosen then
         absorb(join(pack_path, chosen), (list_dir(join(pack_path, chosen))))
         pack.languages[chosen] = true
+    end
+
+    -- Some packs put every sound one level down, in a subfolder called
+    -- "Default", and leave the pack's own folder holding nothing but that.
+    -- Gulf Air is exactly that shape: twenty-one files, none of them where a
+    -- pack keeps them, so the pack was silent and the global Default played in
+    -- its place.  Read it ONLY when the pack's own folder yielded nothing: a
+    -- file sitting properly at the top must always win, and packs that carry
+    -- both (Ryanair has 22 files in each) would otherwise have every
+    -- announcement duplicated.
+    if pack.files == 0 then
+        for _, sub in ipairs(dirs) do
+            if sub:lower() == "default" then
+                absorb(join(pack_path, sub), (list_dir(join(pack_path, sub))))
+                if pack.files > 0 then
+                    log("pack %s keeps its sounds in the '%s' subfolder - reading it",
+                        pack.code, sub)
+                end
+                break
+            end
+        end
     end
 end
 
@@ -895,6 +919,14 @@ local function getf(name, fallback)
     return XPLMGetDataf(ref)
 end
 
+-- Position is published as a double; XPLMGetDataf on it silently loses the
+-- fraction of a degree, which is a mile and a half on the ground.
+local function getd(name, fallback)
+    local ref = find_dref(name)
+    if not ref then return fallback end
+    return XPLMGetDatad(ref)
+end
+
 local function getvi(name, count)
     local ref = find_dref(name)
     if not ref then return nil end
@@ -938,6 +970,75 @@ local function first_seatbelt()
 end
 
 local seatbelt_dref, logo_dref = nil, nil
+
+-- Where the cabin marks the progress of the flight.  The fractions are written
+-- into the file names packs ship (CruiseElapsed50Percent), so they are constants,
+-- not settings: a configurable fraction would make the file itself say something
+-- untrue.  Below the floor the marks are meaningless - on a 40 nm hop half the
+-- route is behind you while the gear is still coming up.
+local CRUISE_MIN_NM = 150
+
+-- Great-circle distance in nautical miles.  A flat approximation would be tens
+-- of miles out on the routes where "half way" is worth announcing at all, and
+-- the whole point of the announcement is that the number is believable.
+local function distance_nm(lat1, lon1, lat2, lon2)
+    local to_rad = math.pi / 180
+    local d_lat = (lat2 - lat1) * to_rad
+    local d_lon = (lon2 - lon1) * to_rad
+    local a = math.sin(d_lat / 2) ^ 2 +
+              math.cos(lat1 * to_rad) * math.cos(lat2 * to_rad) * math.sin(d_lon / 2) ^ 2
+    return 2 * 3440.065 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+end
+
+-- The destination is the last usable entry of the FMS route.  X-Plane publishes
+-- no dataref for it, so the Navigation API is the only source.
+--
+-- FlyWithLua DOES bind XPLMCountFMSEntries and XPLMGetFMSEntryInfo (checked in
+-- the binary), but the shape its wrapper returns is documented NOWHERE - not in
+-- the manual, not in the bundled examples, not in the sources I could reach.
+-- Guessing at a binding's shape is exactly what put the panel on the floor in
+-- 1.1.3 (imgui.SetTooltip), so nothing here is assumed: every call is wrapped,
+-- the results are checked for being a plausible coordinate pair, and a shape
+-- that does not match is reported once and then left alone.  The SDK order is
+-- type, id, ref, altitude, lat, lon - hence the last two numbers.
+local fms_state = { warned = false, dead = false }
+
+local function fms_destination()
+    if fms_state.dead then return nil end
+    if type(XPLMCountFMSEntries) ~= "function" or
+       type(XPLMGetFMSEntryInfo) ~= "function" then
+        fms_state.dead = true
+        log("flight plan: this FlyWithLua does not bind the FMS functions - " ..
+            "route announcements are off")
+        return nil
+    end
+
+    local ok, count = pcall(XPLMCountFMSEntries)
+    if not ok or type(count) ~= "number" or count < 1 then return nil end
+
+    for i = count - 1, 0, -1 do
+        local returned = { pcall(XPLMGetFMSEntryInfo, i) }
+        if returned[1] then
+            local numbers = {}
+            for k = 2, #returned do
+                if type(returned[k]) == "number" then numbers[#numbers + 1] = returned[k] end
+            end
+            local n = #numbers
+            if n >= 2 then
+                local lat, lon = numbers[n - 1], numbers[n]
+                if lat >= -90 and lat <= 90 and lon >= -180 and lon <= 180 and
+                   not (lat == 0 and lon == 0) then
+                    return lat, lon
+                end
+            elseif not fms_state.warned then
+                fms_state.warned = true
+                log("flight plan: XPLMGetFMSEntryInfo returned %d values, none of them a " ..
+                    "coordinate pair - route announcements stay off", n)
+            end
+        end
+    end
+    return nil
+end
 
 local sim = {}          -- refreshed every tick
 
@@ -989,6 +1090,11 @@ local function read_sim()
     end
     s.any_engine = s.engines_running > 0
     s.all_engines_off = s.engines_running == 0
+
+    s.lat = getd("sim/flightmodel/position/latitude", 0)
+    s.lon = getd("sim/flightmodel/position/longitude", 0)
+    s.dest_lat, s.dest_lon = fms_destination()
+    s.route_known = s.dest_lat ~= nil
 
     local local_sec = getf("sim/time/local_time_sec", 43200)
     s.local_hour = math.floor((local_sec % 86400) / 3600)
@@ -1315,6 +1421,12 @@ local function reset_flight(reason, start_phase)
         touchdown_at   = nil,
         liftoff_at     = nil,
         turb_peak      = 0,
+        -- The route measured once, at liftoff, from where the wheels left the
+        -- ground to the last point of the plan.  Measuring it every tick would
+        -- let an edited plan move the finish line under an announcement already
+        -- made.
+        route_total_nm = nil,
+        route_noted    = false,
     }
     queue = {}
     stop_announcement()
@@ -1405,6 +1517,13 @@ local function state_machine()
             end
         end
 
+        -- Standing here long enough that the cabin owes the passengers a word.
+        -- X-Plane knows nothing about schedules, so "we are still here" is the
+        -- only delay a plugin can honestly observe.
+        if cfg.delay_after > 0 and sim_clock - F.phase_since >= cfg.delay_after then
+            once("DepartureDelayed", "boarding running long")
+        end
+
         if cfg.boarding_music and not music and #queue == 0 and not now_playing then
             start_music("BoardingMusic")
         end
@@ -1465,7 +1584,30 @@ local function state_machine()
         if s.alt_ft < 10000 and s.vs_fpm < -400 then set_phase("DESCENT") end
     end
 
+    -- The route is measured once, as soon as we are airborne and there is a plan
+    -- to measure.  On the ground it would be wrong by the length of the taxi.
+    if not s.on_ground and s.route_known and not F.route_total_nm then
+        F.route_total_nm = distance_nm(s.lat, s.lon, s.dest_lat, s.dest_lon)
+        log("route: %.0f nm to the last point of the plan", F.route_total_nm)
+    end
+
     if F.phase == "CRUISE" then
+        -- How much of the route is behind us.  A jump past both marks announces
+        -- only the later one: "half way" after three quarters is a lie.
+        if s.route_known and F.route_total_nm and F.route_total_nm >= CRUISE_MIN_NM then
+            local remaining = distance_nm(s.lat, s.lon, s.dest_lat, s.dest_lon)
+            local flown = 1 - remaining / F.route_total_nm
+            if flown >= 0.75 then
+                once("CruiseElapsed75Percent", "three quarters of the route flown")
+            elseif flown >= 0.50 then
+                once("CruiseElapsed50Percent", "half the route flown")
+            end
+        elseif F.route_total_nm and F.route_total_nm < CRUISE_MIN_NM and not F.route_noted then
+            F.route_noted = true
+            log("route: %.0f nm - too short to mark how much of it is flown",
+                F.route_total_nm)
+        end
+
         if s.vs_fpm < -500 and s.alt_ft > 20000 then
             F.descent_since = F.descent_since or sim_clock
             if sim_clock - F.descent_since > 25 then

@@ -51,6 +51,8 @@ class Sim:
             "sim/cockpit2/switches/fasten_seat_belts": 0,
             "sim/aircraft/engine/acf_num_engines": 2,
             "sim/time/local_time_sec": 9 * 3600.0,
+            "sim/flightmodel/position/latitude": 55.9726,    # UUEE, Sheremetyevo
+            "sim/flightmodel/position/longitude": 37.4146,
             "sim/aircraft/view/acf_livery_path": 0,   # string dataref, value comes via dataref()
             "FlyWithLua_InteriorChannelGroup/Volume": 0.0,
             "FlyWithLua_MasterChannelGroup/Volume": 0.0,
@@ -58,6 +60,9 @@ class Sim:
             "FlyWithLua_Com1ChannelGroup/Volume": 0.0,
         }
         self.arrays = {"sim/flightmodel/engine/ENGN_running": [0, 0]}
+        # The FMS route, as (lat, lon) per entry. Empty = no plan loaded, which is
+        # how most hand-flown legs look and must stay silent.
+        self.fms = []
         self.played = []          # (t, bus, filename)
         self.played_wall = []     # wall-clock second of each play
         self.volume_trace = []    # (t, music volume) while a PA is playing
@@ -100,6 +105,8 @@ class Sim:
         "parkbrake": "sim/flightmodel/controls/parkbrake",
         "battery": "sim/cockpit2/electrical/battery_on",
         "seatbelt": "sim/cockpit2/switches/fasten_seat_belts",
+        "lat": "sim/flightmodel/position/latitude",
+        "lon": "sim/flightmodel/position/longitude",
     }
 
     def set(self, **kwargs):
@@ -108,6 +115,10 @@ class Sim:
                 self.arrays["sim/flightmodel/engine/ENGN_running"] = [1, 1] if value else [0, 0]
             elif key == "local_hour":
                 self.values["sim/time/local_time_sec"] = value * 3600.0
+            elif key == "dest":
+                # None = flying without a plan, which is the common case and has
+                # to stay silent rather than measure a route to nowhere.
+                self.fms = list(value) if value else []
             else:
                 self.values[self.ALIAS[key]] = value
 
@@ -184,7 +195,20 @@ def build_runtime(sim, library, config_extra="", livery_path="", plane_icao="A32
     g.XPLMGetDatai = sim.get_i
     g.XPLMGetDataf = sim.get_f
     g.XPLMSetDataf = sim.set_f
+    g.XPLMGetDatad = sim.get_f
     g.XPLMGetDatavi = lambda ref, offset, count: lua.table_from(sim.get_vi(ref, offset, count))
+
+    # The FMS as FlyWithLua exposes it. The wrapper's real return shape is
+    # documented nowhere, so the bench reproduces the SDK's own order - type, id,
+    # ref, altitude, lat, lon - and the plugin picks the coordinate pair out of
+    # whatever it is handed rather than trusting a position.
+    g.XPLMCountFMSEntries = lambda: len(sim.fms)
+    def fms_entry_info(index):
+        if index < 0 or index >= len(sim.fms):
+            return 0, "", 0, 0, 0.0, 0.0
+        lat, lon = sim.fms[index]
+        return 1, "WPT%d" % index, 0, 35000, lat, lon
+    g.XPLMGetFMSEntryInfo = fms_entry_info
 
     def dataref_stub(var_name, path, *rest):
         # FlyWithLua publishes string datarefs as a global; mimic that
@@ -228,6 +252,7 @@ def build_runtime(sim, library, config_extra="", livery_path="", plane_icao="A32
         local names = {
             "directory_to_table", "logMsg", "load_fmod_sound",
             "XPLMFindDataRef", "XPLMGetDatai", "XPLMGetDataf", "XPLMSetDataf",
+            "XPLMGetDatad", "XPLMCountFMSEntries", "XPLMGetFMSEntryInfo",
             "XPLMGetDatavi", "dataref", "do_every_frame", "do_often",
             "do_every_draw", "create_command", "add_macro", "float_wnd_create",
             "XPLMSetGraphicsState", "draw_string_Helvetica_12", "measure_string",
@@ -759,6 +784,40 @@ def scenario_regressions(library):
           "and the neo still rejects the other lengths of the family")
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.rmtree(neo, ignore_errors=True)
+
+    # --- a pack that keeps its sounds in a "Default" subfolder ---------------
+    # Gulf Air on the real disk has nothing in its own folder and twenty-one
+    # files one level down. It was silent, and the global Default played instead.
+    nested = tempfile.mkdtemp(prefix="xa_nested_")
+    os.makedirs(os.path.join(nested, "TST", "Default"))
+    os.makedirs(os.path.join(nested, "DEFAULT"))
+    donor = os.path.join(fixture, "TST", "ArmDoors.ogg")
+    for event in ("BoardingWelcome", "SafetyBriefing", "AfterTakeoff", "AfterLanding"):
+        shutil.copy(donor, os.path.join(nested, "TST", "Default", event + ".ogg"))
+    shutil.copy(donor, os.path.join(nested, "DEFAULT", "BoardingWelcome.ogg"))
+    sim = Sim()
+    lua, tmp = build_runtime(
+        sim, nested, "airline_mode = manual\nairline_manual = TST\nauto_find = false\n")
+    run_script(lua)
+    files = lua.eval("function() return XA_DEBUG.library().packs['TST'].files end")()
+    check(files == 4, "a pack whose sounds live in Default/ is read (%s files)" % files)
+
+    # And the other half: a pack with files of its own must NOT also swallow its
+    # Default subfolder, or every announcement it owns would be duplicated.
+    both = tempfile.mkdtemp(prefix="xa_both_")
+    os.makedirs(os.path.join(both, "TST", "Default"))
+    shutil.copy(donor, os.path.join(both, "TST", "BoardingWelcome.ogg"))
+    shutil.copy(donor, os.path.join(both, "TST", "Default", "BoardingWelcome.ogg"))
+    sim2 = Sim()
+    lua2, tmp2 = build_runtime(
+        sim2, both, "airline_mode = manual\nairline_manual = TST\nauto_find = false\n")
+    run_script(lua2)
+    files2 = lua2.eval("function() return XA_DEBUG.library().packs['TST'].files end")()
+    check(files2 == 1, "and a pack with its own files ignores it (%s files)" % files2)
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(tmp2, ignore_errors=True)
+    shutil.rmtree(nested, ignore_errors=True)
+    shutil.rmtree(both, ignore_errors=True)
 
     # --- cabin ambience is independent of the boarding-music setting ---------
     sim = Sim()
