@@ -992,14 +992,18 @@ local function read_sim()
 
     local local_sec = getf("sim/time/local_time_sec", 43200)
     s.local_hour = math.floor((local_sec % 86400) / 3600)
-    if s.local_hour >= 5 and s.local_hour < 12 then
+    -- Night is tested first because it is the range that wraps midnight.  With
+    -- morning first, 01:00 fell past "is it morning" into "is it before 17:00"
+    -- and came out as afternoon: a pack's [Night] greeting was unreachable
+    -- between midnight and 05:00, and an [Afternoon] one played instead.
+    if s.local_hour < 5 or s.local_hour >= 22 then
+        s.daypart = "night"
+    elseif s.local_hour < 12 then
         s.daypart = "morning"
     elseif s.local_hour < 17 then
         s.daypart = "afternoon"
-    elseif s.local_hour < 22 then
-        s.daypart = "evening"
     else
-        s.daypart = "night"
+        s.daypart = "evening"
     end
     s.is_dark = (s.local_hour >= 21 or s.local_hour < 6)
     return s
