@@ -1023,6 +1023,43 @@ local queue        = {}     -- pending announcements
 local now_playing  = nil    -- { event, path, started, duration }
 local music        = nil    -- { event, path, started, duration }
 
+-- Re-engining gives an aeroplane a new ICAO designator that shares nothing with
+-- the old one -- an A320neo is A20N, not A320N -- while the cabin, the doors and
+-- therefore the announcement stay exactly the same.  Pack authors tag the cabin
+-- they recorded for ([A320], [B738]), so these pairs have to be read as one
+-- aeroplane or a neo pilot hears the generic Default file.  Only re-engined
+-- variants of the same fuselage belong here: an A359 and an A35K are different
+-- cabins and must stay apart.
+local SAME_CABIN = {
+    A19N = "A319", A319 = "A19N",
+    A20N = "A320", A320 = "A20N",
+    A21N = "A321", A321 = "A21N",
+    B37M = "B737", B737 = "B37M",
+    B38M = "B738", B738 = "B38M",
+    B39M = "B739", B739 = "B39M",
+    E290 = "E190", E190 = "E290",
+    E295 = "E195", E195 = "E295",
+}
+
+-- A tag matches when it is the aeroplane's code, or when one is the beginning of
+-- the other and both are at least three characters: [A32] catches an A320, and
+-- the length floor is what stops [A] catching everything.
+local function prefix_matches(tag, plane)
+    if tag == plane then return true end
+    if #tag < 3 or #plane < 3 then return false end
+    return tag:find(plane, 1, true) == 1 or plane:find(tag, 1, true) == 1
+end
+
+local function aircraft_matches(tag, plane)
+    if plane == "" then return false end
+    if prefix_matches(tag, plane) then return true end
+    -- Both directions, so that a pack tagged [A20N] is heard in a ceo as well.
+    local twin = SAME_CABIN[plane]
+    if twin and prefix_matches(tag, twin) then return true end
+    local tag_twin = SAME_CABIN[tag]
+    return tag_twin ~= nil and prefix_matches(tag_twin, plane)
+end
+
 local function candidate_score(entry)
     local info = entry.info
     local score = 0
@@ -1031,8 +1068,7 @@ local function candidate_score(entry)
         local plane = (PLANE_ICAO or ""):upper()
         local matched = false
         for tag in pairs(info.aircraft) do
-            if plane ~= "" and (tag == plane or
-               (#tag >= 3 and #plane >= 3 and (tag:find(plane, 1, true) == 1 or plane:find(tag, 1, true) == 1))) then
+            if aircraft_matches(tag, plane) then
                 matched = true
             end
         end

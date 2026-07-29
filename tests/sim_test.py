@@ -118,7 +118,7 @@ class Sim:
         return [name for _, bus, name in self.played if bus == "master" and name != "<stop>"]
 
 
-def build_runtime(sim, library, config_extra="", livery_path=""):
+def build_runtime(sim, library, config_extra="", livery_path="", plane_icao="A320"):
     livery = [livery_path]
     lua = LuaRuntime(unpack_returned_tuples=True)
     g = lua.globals()
@@ -141,7 +141,7 @@ def build_runtime(sim, library, config_extra="", livery_path=""):
     g.SCRIPT_DIRECTORY = tmp + "/"
     g.SYSTEM_DIRECTORY = tmp + "/"
     g.PLUGIN_VERSION = "2.8.10"
-    g.PLANE_ICAO = "A320"
+    g.PLANE_ICAO = plane_icao
     g.PLANE_TAILNUMBER = "VP-BKA"
     g.PLANE_DESCRIP = "Airbus A320"
     g.AIRCRAFT_FILENAME = "A320.acf"
@@ -735,6 +735,30 @@ def make_fixture_library(source_library):
 def scenario_regressions(library):
     print("\n=== scenario 8: fixed defects stay fixed ===")
     fixture = make_fixture_library(library)
+
+    # --- a re-engined aeroplane hears the file its twin was recorded for -----
+    # X-Plane reports an A320neo as A20N (ICAO Doc 8643), a designator sharing no
+    # prefix with A320, so every [A320] file was disqualified and the neo fell
+    # through to Default.  The bench missed it for one reason: it only ever flew
+    # a ceo, and the matching rule was written against "A320N", a string no
+    # aeroplane emits.  This check flies the code X-Plane actually reports.
+    neo = make_fixture_library(library)
+    donor = os.path.join(neo, "TST", "ArmDoors.ogg")
+    for tag in ("[A319]", "[A320]", "[A321]"):
+        shutil.copy(donor, os.path.join(neo, "TST", "PreSafetyBriefing%s.ogg" % tag))
+    sim = Sim()
+    lua, tmp = build_runtime(
+        sim, neo, "airline_mode = manual\nairline_manual = TST\nauto_find = false\n",
+        plane_icao="A20N")
+    run_script(lua)
+    fly(lua, sim)
+    events = sim.announcements()
+    check(any("PreSafetyBriefing[A320]" in e for e in events),
+          "an A320neo (A20N) hears the file tagged [A320]")
+    check(all("[A319]" not in e and "[A321]" not in e for e in events),
+          "and the neo still rejects the other lengths of the family")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(neo, ignore_errors=True)
 
     # --- cabin ambience is independent of the boarding-music setting ---------
     sim = Sim()
