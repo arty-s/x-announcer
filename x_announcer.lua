@@ -234,8 +234,8 @@ local CFG_HELP = {
     airline_manual   = "код ICAO пака, который использовать принудительно",
     announce_bus     = "шина FMOD для объявлений: interior (салон), master, ui, com1",
     music_bus        = "шина FMOD для фоновой музыки, обязана отличаться от announce_bus",
-    volume           = "громкость объявлений, 0.0 - 1.0",
-    music_volume     = "громкость фоновой музыки, 0.0 - 1.0",
+    volume           = "громкость объявлений, 0.0 - 2.0 (выше 1.0 - усиление)",
+    music_volume     = "громкость фоновой музыки, 0.0 - 2.0 (выше 1.0 - усиление)",
     duck             = "во сколько раз приглушать музыку на время объявления",
     enabled          = "false - объявления полностью выключены",
     boarding_music   = "играть музыку между приветствиями при посадке пассажиров",
@@ -493,9 +493,20 @@ local function find_dref(name)
     return cached
 end
 
+-- The ceiling is 2.0, not 1.0. The packs are mixed about 19 dB apart (measured
+-- across 62 files from all 32 packs: median RMS -18.6 dBFS, quietest -30.3),
+-- and X-Plane's own interior and master sliders sit downstream of this one, so
+-- at 1.0 a quiet pack simply cannot be made loud enough. FMOD channel groups
+-- take a gain above unity.
+--
+-- v2 also levels each file to a common target when it decodes it. This branch
+-- cannot: FlyWithLua hands FMOD the file and never the samples, so there is
+-- nothing here to measure. The ceiling is the half of the fix 1.x can have.
+local MAX_VOLUME = 2.0
+
 local function set_bus_volume(bus, value)
     local ref = find_dref(VOL_DREF[bus])
-    if ref then XPLMSetDataf(ref, clamp(value, 0, 1)) end
+    if ref then XPLMSetDataf(ref, clamp(value, 0, MAX_VOLUME)) end
 end
 
 ----------------------------------------------------------------------------
@@ -941,14 +952,28 @@ local function first_dref(list)
     return nil
 end
 
--- Seat belt sign, most specific first.  `on` is the value that means "lit":
--- the Zibo/laminar switch is a three-position knob (0 off, 1 auto, 2 on), the
--- others are plain on/off.
+-- What X-Plane itself publishes about the SIGN, as opposed to the switch:
+-- "Seatbelt sign on, yes or no", read-only.  This is the answer to the question
+-- the plugin actually asks, and the only source that can be right while a switch
+-- sits in AUTO - there the crew has handed the decision to the aeroplane and the
+-- detent stops reporting the sign.
+local SEATBELT_ANNUNCIATOR = "sim/cockpit2/annunciators/fasten_seatbelt"
+
+-- Seat belt sign, most specific first.  `on` is the value that means "lit";
+-- `auto` is the AUTO detent of a three-position switch, where it has one.
 local SEATBELT_CANDIDATES = {
     { name = "AirbusFBW/SeatBeltSignsOn",                            on = 1 }, -- ToLiss
     { name = "b737ng/equipment/alerts/crew/cabin/CRW_seatbelts_on",  on = 1 }, -- 737NG Series
     { name = "Rotate/aircraft/controls/seatbelts_lts",               on = 1 }, -- MD-11
-    { name = "laminar/B738/toggle_switch/seatbelt_sign_pos",         on = 2 }, -- Zibo
+    { name = "laminar/B738/toggle_switch/seatbelt_sign_pos",         on = 2, auto = 1 }, -- Zibo
+    -- FlightFactor 777 v2.  The widget is passSignsSeatbeltsSwitch with
+    -- off(0)/auto(1)/on(2), read from modules/idxData_B772.txt; the dataref name
+    -- follows the aircraft's own convention, 1-sim/ckpt/<widget>/anim, seen on
+    -- some fifty other switches.  NOT verified in the sim - the string lives in
+    -- an encrypted module - so if it is wrong the log names what was bound
+    -- instead, and the annunciator below still answers.
+    { name = "1-sim/ckpt/passSignsSeatbeltsSwitch/anim",             on = 2, auto = 1 },
+    { name = SEATBELT_ANNUNCIATOR,                                   on = 1 },
     { name = "sim/cockpit2/switches/fasten_seat_belts",              on = 1 },
     { name = "sim/cockpit/switches/fasten_seat_belts",               on = 1 },
 }
@@ -970,6 +995,8 @@ local function first_seatbelt()
 end
 
 local seatbelt_dref, logo_dref = nil, nil
+-- Said once per hand-over, not every frame.
+local seatbelt_auto_logged = false
 
 -- Where the cabin marks the progress of the flight.  The fractions are written
 -- into the file names packs ship (CruiseElapsed50Percent), so they are constants,
@@ -1072,7 +1099,23 @@ local function read_sim()
                 local as_float = XPLMGetDataf(ref)
                 if as_float and as_float >= seatbelt_dref.on - 0.5 then value = seatbelt_dref.on end
             end
-            s.seatbelt = value >= seatbelt_dref.on
+            -- A switch in AUTO is not a state of the sign - it is the crew
+            -- saying "aeroplane, you decide".  Reading the detent then answers
+            -- the wrong question: on a 777 above ten thousand feet the sign goes
+            -- out while the switch stays where it was, which is exactly the
+            -- transition this plugin exists to announce.
+            local sign = seatbelt_dref.auto and find_dref(SEATBELT_ANNUNCIATOR) or nil
+            if sign and value == seatbelt_dref.auto then
+                s.seatbelt = XPLMGetDatai(sign) == 1
+                if not seatbelt_auto_logged then
+                    seatbelt_auto_logged = true
+                    log("seatbelt switch is in AUTO - reading the sign from %s instead",
+                        SEATBELT_ANNUNCIATOR)
+                end
+            else
+                s.seatbelt = value >= seatbelt_dref.on
+                seatbelt_auto_logged = false
+            end
         end
     end
 
@@ -2800,10 +2843,10 @@ local function draw_settings_tab()
 
     text_col(COL.muted, "Volume")
     imgui.SetNextItemWidth(200)
-    changed, value = imgui.SliderFloat("announcements", cfg.volume, 0, 1, "%.2f")
+    changed, value = imgui.SliderFloat("announcements", cfg.volume, 0, MAX_VOLUME, "%.2f")
     if changed then cfg.volume = value config_save() end
     imgui.SetNextItemWidth(200)
-    changed, value = imgui.SliderFloat("boarding music", cfg.music_volume, 0, 1, "%.2f")
+    changed, value = imgui.SliderFloat("boarding music", cfg.music_volume, 0, MAX_VOLUME, "%.2f")
     if changed then cfg.music_volume = value config_save() end
     imgui.SetNextItemWidth(200)
     changed, value = imgui.SliderFloat("music ducking", cfg.duck, 0, 1, "%.2f")
