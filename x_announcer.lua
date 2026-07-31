@@ -1454,7 +1454,6 @@ local function reset_flight(reason, start_phase)
         phase_since    = sim_clock,
         done           = {},          -- event -> time it was queued
         ended          = {},          -- event -> time playback finished
-        boarding_open  = false,
         last_welcome   = -1e9,
         seatbelt_prev  = nil,
         last_seatbelt  = -1e9,
@@ -1491,6 +1490,25 @@ local function once(event, reason)
     if enqueue(event, reason) then return true end
     F.ended[event] = sim_clock       -- nothing to play: unblock whatever waits on it
     return false
+end
+
+-- Boarding because somebody said so: the button on the Flight tab, or the
+-- command behind it bound to a switch in the cockpit.  With auto_boarding off
+-- this is the ONLY way into the phase, which is what the setting's help text has
+-- always promised ("false - только кнопкой").
+--
+-- One function for both entrances, deliberately.  They used to be two, and they
+-- had already drifted: the button set boarding_open, the command did not.
+--
+-- It announces BoardingStarted, exactly as the automatic path does.  Neither
+-- entrance did before: reset_flight lands straight in BOARDING, while once() for
+-- that event lives in the PREFLIGHT branch, which manual boarding never passes
+-- through.  Two ways into one action must not sound different.
+local function start_boarding(reason)
+    reset_flight(reason, "BOARDING")
+    -- reset_flight rebuilds F, so last_welcome is back at its floor and the
+    -- welcome is due on the next tick rather than one boarding_repeat later.
+    once("BoardingStarted", reason)
 end
 
 -- true once the file has actually finished playing (plus an optional pause)
@@ -1530,7 +1548,6 @@ local function state_machine()
         local power = aircraft_powered(s)
         if s.on_ground and s.all_engines_off and not s.beacon and s.gs_kt < 1 then
             if cfg.auto_boarding and power then
-                F.boarding_open = true
                 set_phase("BOARDING")
                 once("BoardingStarted", "cabin ready")
             end
@@ -2553,9 +2570,7 @@ local function draw_flight_tab()
     end
     imgui.SameLine()
     if imgui.Button("Start boarding", 120, 22) then
-        reset_flight("manual boarding", "BOARDING")
-        F.boarding_open = true
-        F.last_welcome = -1e9
+        start_boarding("manual boarding")
     end
     imgui.SameLine()
     if imgui.Button("Reset flight", 100, 22) then
@@ -3180,8 +3195,7 @@ function xa_skip()
 end
 
 function xa_start_boarding()
-    reset_flight("command", "BOARDING")
-    F.last_welcome = -1e9
+    start_boarding("command")
 end
 
 ----------------------------------------------------------------------------
