@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.1.5"
+local VERSION = "1.2.0"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -184,6 +184,7 @@ local cfg = {
     night_dim        = true,      -- CabinDim* announcements
     landing_reaction = true,      -- LandingGreat / LandingTerrible
     seatbelt_dref    = "",        -- optional manual override
+    dataref_probe    = true,      -- log the sign datarefs that move, to identify unknown aircraft
     window_scale     = 1.0,
     auto_find        = true,      -- look for an existing UA_Sounds folder
     music_max_loops  = 6,         -- see the note about FlyWithLua's FMOD memory
@@ -200,7 +201,7 @@ local CFG_ORDER = {
     "announce_bus", "music_bus", "volume", "music_volume", "duck",
     "enabled", "boarding_music", "cabin_noise", "auto_boarding",
     "boarding_repeat", "delay_after", "pilot_welcome", "door_calls", "night_dim",
-    "landing_reaction", "seatbelt_dref", "window_scale", "auto_find",
+    "landing_reaction", "seatbelt_dref", "dataref_probe", "window_scale", "auto_find",
     "music_max_loops", "simbrief_id",
     "widget", "widget_mode", "widget_opacity", "widget_x", "widget_y",
 }
@@ -248,6 +249,7 @@ local CFG_HELP = {
     night_dim        = "объявления про притушенный свет в салоне ночью",
     landing_reaction = "реакция салона на касание: LandingGreat или LandingTerrible",
     seatbelt_dref    = "свой датареф табло ремней; пусто - искать автоматически",
+    dataref_probe    = "писать в журнал датарефы про ремни и знаки, которые меняются; по этим строкам видно, чем управляется табло на незнакомом борте",
     window_scale     = "масштаб текста в окне, 1.0 - обычный; больше для VR",
     auto_find        = "искать готовую папку UA_Sounds, если в library паков не нашлось",
     music_max_loops  = "сколько раз зацикливать фоновый трек (FlyWithLua не освобождает память на каждом повторе)",
@@ -492,6 +494,25 @@ local function find_dref(name)
     if cached == false then return nil end
     return cached
 end
+
+-- Throws away a remembered "this aeroplane has no such dataref".  The cache
+-- exists because looking a name up is expensive; but a NEGATIVE answer is only
+-- true for the moment it was given, and an add-on that registers its datarefs a
+-- second after the aeroplane loads would stay missing for the whole flight.
+local function forget_dref(name)
+    if name and name ~= "" then dref_cache[name] = nil end
+end
+-- (kept a plain local: it is called from the boot code, before `belt` exists)
+
+-- Whole numbers as whole numbers: "2", not "2.000", so a switch position in the
+-- log reads like a switch position.
+local function fmt_num(v)
+    if math.abs(v - math.floor(v + 0.5)) < 0.001 then
+        return string.format("%d", math.floor(v + 0.5))
+    end
+    return string.format("%.3f", v)
+end
+
 
 -- The ceiling is 2.0, not 1.0. The packs are mixed about 19 dB apart (measured
 -- across 62 files from all 32 packs: median RMS -18.6 dBFS, quietest -30.3),
@@ -960,22 +981,73 @@ end
 local SEATBELT_ANNUNCIATOR = "sim/cockpit2/annunciators/fasten_seatbelt"
 
 -- Seat belt sign, most specific first.  `on` is the value that means "lit";
--- `auto` is the AUTO detent of a three-position switch, where it has one.
+-- `auto` is the AUTO detent of a three-position switch, where it has one, and
+-- `rule` says how that detent is turned into "is the sign lit".
+--
+-- Only datarefs an AEROPLANE publishes belong here.  The stock ones live in
+-- their own list below, and for a sharp reason: a stock name resolves ALWAYS,
+-- whatever is loaded, so one in this chain would end the search at the first
+-- miss and leave everything under it unreachable.  That is exactly how a Zibo
+-- 737 came to be read through an annunciator its own systems never write - a
+-- grep over the whole aircraft folder finds no mention of it at all.
 local SEATBELT_CANDIDATES = {
+    -- Zibo/LevelUp 737.  The lamp first: the aeroplane's own script has already
+    -- resolved AUTO in it (flaps out or gear down, masks override everything),
+    -- so it needs no rule of ours.  It comes from the FMOD sound pack script and
+    -- older builds have none, hence the switch right behind it.  Mind the case:
+    -- B738 on the switch, b738 on the lamp.
+    { name = "laminar/b738/fmodpack/seatbelt_on_light",              on = 1 },
+    { name = "laminar/B738/toggle_switch/seatbelt_sign_pos",         on = 2, auto = 1,
+      rule = "flaps_or_gear" },
     { name = "AirbusFBW/SeatBeltSignsOn",                            on = 1 }, -- ToLiss
-    { name = "b737ng/equipment/alerts/crew/cabin/CRW_seatbelts_on",  on = 1 }, -- 737NG Series
     { name = "Rotate/aircraft/controls/seatbelts_lts",               on = 1 }, -- MD-11
-    { name = "laminar/B738/toggle_switch/seatbelt_sign_pos",         on = 2, auto = 1 }, -- Zibo
-    -- FlightFactor 777 v2.  The widget is passSignsSeatbeltsSwitch with
-    -- off(0)/auto(1)/on(2), read from modules/idxData_B772.txt; the dataref name
-    -- follows the aircraft's own convention, 1-sim/ckpt/<widget>/anim, seen on
-    -- some fifty other switches.  NOT verified in the sim - the string lives in
-    -- an encrypted module - so if it is wrong the log names what was bound
-    -- instead, and the annunciator below still answers.
-    { name = "1-sim/ckpt/passSignsSeatbeltsSwitch/anim",             on = 2, auto = 1 },
-    { name = SEATBELT_ANNUNCIATOR,                                   on = 1 },
-    { name = "sim/cockpit2/switches/fasten_seat_belts",              on = 1 },
-    { name = "sim/cockpit/switches/fasten_seat_belts",               on = 1 },
+    { name = "Rotate/md80/systems/seatbelts_switch",                 on = 1 }, -- MD-80
+    -- FlightFactor 777.  Two names: the second follows the aircraft's own naming
+    -- convention (1-sim/ckpt/<widget>/anim, the widget is passSignsSeatbeltsSwitch
+    -- from modules/idxData_B772.txt) and has never been seen live because the
+    -- string lives in an encrypted module; the first is what a community script
+    -- covering two dozen aeroplanes reads on the 777-200ER v2.  Whichever exists
+    -- wins, and the log says which.
+    { name = "1-sim/anim/seatbeltLight",                             on = 2, auto = 1,
+      rule = "sign_then_flaps" },
+    { name = "1-sim/ckpt/passSignsSeatbeltsSwitch/anim",             on = 2, auto = 1,
+      rule = "sign_then_flaps" },
+    { name = "laminar/A333/switches/fasten_seatbelts",               on = 2, auto = 1,
+      rule = "sign_then_flaps" },
+    { name = "laminar/B747/safety/seat_belts/sel_dial_pos",          on = 2, auto = 1,
+      rule = "sign_then_flaps" },
+    { name = "CL650/overhead/signs/seatbelt_value",                  on = 1 },
+    { name = "SSG/EJET/SIGNS/fasten_belts_sw",                       on = 1 },
+    { name = "ssg/PASS/passenger_signal_sw",                         on = 1 },
+    { name = "aero787/cockpit/overhead/switches/seatbelts",          on = 1 },
+    { name = "B742/OVHD/fasten_belts",                               on = 1 },
+    { name = "FJS/727/lights/FastenBeltsSwitch",                     on = 1 },
+    { name = "sim/custom/switchers/ovhd/sign_belts",                 on = 1 }, -- Felis Tu-154
+}
+
+-- One table, not a dozen loose locals: the main chunk of a Lua script may hold
+-- 200 of them and this one is already close to the ceiling.
+--
+-- `stock` is what X-Plane publishes itself.  Used only when the aeroplane
+-- offered nothing, and all of them together: an aeroplane that bothers with
+-- either the annunciator or the stock switch usually drives only one of the two.
+local belt = {
+    stock = {
+        SEATBELT_ANNUNCIATOR,
+        "sim/cockpit2/switches/fasten_seat_belts",
+        "sim/cockpit/switches/fasten_seat_belts",
+    },
+    -- The annunciator is believed only once it has been seen lit.  On an
+    -- aeroplane that runs its own cabin signs it exists, reads zero all flight,
+    -- and a switch in AUTO read through it would report a sign that never lights.
+    sign_seen_lit = false,
+    note_prev = nil,       -- diagnostics only; see where it is used
+    -- Nothing of the aeroplane's own found YET.  Not "nothing found": stock
+    -- names always resolve, so this is the state to keep searching from.
+    fallback = true,
+    search_until = -1,
+    next_retry = 0,
+    gave_up = false,
 }
 
 -- X-Plane itself has no logo light dataref; only add-ons provide one.
@@ -997,6 +1069,146 @@ end
 local seatbelt_dref, logo_dref = nil, nil
 -- Said once per hand-over, not every frame.
 local seatbelt_auto_logged = false
+
+-- What the aeroplane does with a switch left in AUTO.  Taken from the 737's own
+-- cabin logic rather than invented: the sign is lit with flaps out or the gear
+-- down - departure and arrival - and deployed masks override the lot.
+function belt.auto_lit()
+    if geti("sim/operation/failures/rel_pass_o2_on", 0) == 6 then return true end
+    if getf("sim/cockpit2/controls/flap_ratio", 0) > 0.01 then return true end
+    return geti("sim/cockpit2/controls/gear_handle_down", 0) == 1
+end
+
+-- Reads the stock datarefs, whichever of them this aeroplane bothers with.
+function belt.stock_lit()
+    for _, name in ipairs(belt.stock) do
+        if geti(name, 0) == 1 then return true end
+    end
+    return false
+end
+
+-- Binds the sign, telling apart "found the aeroplane's own" from "fell back to
+-- stock".  Announces only when something changed, so the retry is silent until
+-- it has news.
+function belt.bind(announce)
+    local was = seatbelt_dref and seatbelt_dref.name or nil
+    seatbelt_dref = first_seatbelt()
+    seatbelt_auto_logged = false
+    belt.fallback = seatbelt_dref == nil
+    local now = seatbelt_dref and seatbelt_dref.name or "штатные датарефы X-Plane"
+    if announce or now ~= was then
+        if belt.fallback then
+            log("datarefs: seatbelt %s - ничего своего у борта пока не нашлось, ищу дальше", now)
+        else
+            log("datarefs: seatbelt %s", now)
+        end
+    end
+end
+
+-- FlyWithLua cannot enumerate datarefs - its binary carries XPLMFindDataRef and
+-- nothing else - so where v2 asks X-Plane for every name that looks like a cabin
+-- sign, this branch can only watch the names it already knows.  That is still
+-- the difference between "the switch does nothing" and "THIS is the dataref the
+-- switch moves": the user flips it, sends the log, and the line names it.
+belt.probe_extra = {
+    "laminar/B738/toggle_switch/no_smoking_pos",
+    "laminar/b738/fmodpack/play_belts",
+    "AirbusFBW/NoSmokingSignsOn",
+    "sim/cockpit2/annunciators/no_smoking",
+    "thranda/cockpit/actuators/SeatbeltSignSwitch",
+    "cl300/switches/seatbelt",
+    "ixeg/733/lighting/seatbelt_sign_act",
+    "sim/cockpit/switches/no_smoking",
+}
+
+belt.probe = { watch = nil, lines = 0, next = 0, max_lines = 120 }
+
+function belt.probe.names()
+    local names, seen = {}, {}
+    local function add(name)
+        if name and name ~= "" and not seen[name] then
+            seen[name] = true
+            names[#names + 1] = name
+        end
+    end
+    add(cfg.seatbelt_dref)
+    for _, c in ipairs(SEATBELT_CANDIDATES) do add(c.name) end
+    for _, n in ipairs(belt.stock) do add(n) end
+    for _, n in ipairs(belt.probe_extra) do add(n) end
+    return names
+end
+
+-- Builds the watch list out of the names this aeroplane actually has, and says
+-- what each one reads right now: half the reports arrive with the switch exactly
+-- where the user left it, and then the starting values are the only evidence.
+function belt.probe.build()
+    belt.probe.watch = {}
+    if not cfg.dataref_probe then return end
+    for _, name in ipairs(belt.probe.names()) do
+        if find_dref(name) then
+            local value = getf(name, 0)
+            belt.probe.watch[#belt.probe.watch + 1] = { name = name, value = value, changes = 0 }
+            if belt.probe.lines < belt.probe.max_lines then
+                belt.probe.lines = belt.probe.lines + 1
+                log("probe: %s = %s", name, fmt_num(value))
+            end
+        end
+    end
+    if #belt.probe.watch > 0 then
+        log("probe: под наблюдением %d датарефов про ремни и знаки", #belt.probe.watch)
+    end
+end
+
+function belt.probe.poll()
+    if not cfg.dataref_probe or not belt.probe.watch then return end
+    if real_clock < belt.probe.next then return end
+    belt.probe.next = real_clock + 0.25
+    for _, w in ipairs(belt.probe.watch) do
+        if not w.dropped then
+            local now = getf(w.name, 0)
+            if math.abs(now - w.value) >= 0.0005 then
+                local was = w.value
+                w.value = now
+                w.changes = w.changes + 1
+                if w.changes > 12 then
+                    w.dropped = true
+                    log("probe: %s меняется непрерывно - снимаю с наблюдения", w.name)
+                elseif belt.probe.lines < belt.probe.max_lines then
+                    belt.probe.lines = belt.probe.lines + 1
+                    log("probe: %s %s -> %s", w.name, fmt_num(was), fmt_num(now))
+                end
+            end
+        end
+    end
+end
+
+-- The aeroplane's own plugin registers its datarefs when it pleases, and
+-- FlyWithLua reloads this script on its own schedule, so one look at load time
+-- decides nothing.  The search keeps going for two minutes, and the negative
+-- answers cached by find_dref are thrown away first - otherwise a dataref that
+-- appears late would stay "missing" for the rest of the session.
+function belt.search_begin()
+    belt.search_until = real_clock + 120
+    belt.next_retry = 0
+    belt.gave_up = false
+end
+
+function belt.search_step()
+    if not belt.fallback or belt.gave_up then return end
+    if real_clock >= belt.search_until then
+        belt.gave_up = true
+        log("datarefs: за две минуты этот борт не опубликовал своего датарефа табло ремней - "
+            .. "читаю штатные. Если табло живёт своей жизнью, пришлите журнал: строки probe: "
+            .. "назовут датареф, которым оно управляется")
+        return
+    end
+    if real_clock < belt.next_retry then return end
+    belt.next_retry = real_clock + 2
+    for _, c in ipairs(SEATBELT_CANDIDATES) do forget_dref(c.name) end
+    if cfg.seatbelt_dref ~= "" then forget_dref(cfg.seatbelt_dref) end
+    belt.bind(false)
+    if not belt.fallback then belt.probe.build() end
+end
 
 -- Where the cabin marks the progress of the flight.  The fractions are written
 -- into the file names packs ship (CruiseElapsed50Percent), so they are constants,
@@ -1104,19 +1316,36 @@ local function read_sim()
             -- the wrong question: on a 777 above ten thousand feet the sign goes
             -- out while the switch stays where it was, which is exactly the
             -- transition this plugin exists to announce.
-            local sign = seatbelt_dref.auto and find_dref(SEATBELT_ANNUNCIATOR) or nil
-            if sign and value == seatbelt_dref.auto then
-                s.seatbelt = XPLMGetDatai(sign) == 1
-                if not seatbelt_auto_logged then
-                    seatbelt_auto_logged = true
-                    log("seatbelt switch is in AUTO - reading the sign from %s instead",
-                        SEATBELT_ANNUNCIATOR)
+            --
+            -- Which way the aeroplane decides is not ours to invent.  The
+            -- annunciator is used where it is genuinely driven, and "genuinely"
+            -- means it has been seen lit at least once; everything else follows
+            -- the aeroplane's own rule, flaps and gear.
+            if seatbelt_dref.auto and value == seatbelt_dref.auto then
+                local sign_lit = geti(SEATBELT_ANNUNCIATOR, 0) == 1
+                if sign_lit then belt.sign_seen_lit = true end
+                if seatbelt_dref.rule == "sign_then_flaps" and belt.sign_seen_lit then
+                    s.seatbelt = sign_lit
+                    if not seatbelt_auto_logged then
+                        seatbelt_auto_logged = true
+                        log("seatbelt switch is in AUTO - reading the sign from %s instead",
+                            SEATBELT_ANNUNCIATOR)
+                    end
+                else
+                    s.seatbelt = belt.auto_lit()
+                    if not seatbelt_auto_logged then
+                        seatbelt_auto_logged = true
+                        log("seatbelt switch is in AUTO - самолёт решает сам, беру табло по "
+                            .. "закрылкам и шасси (%s тут не загорается)", SEATBELT_ANNUNCIATOR)
+                    end
                 end
             else
                 s.seatbelt = value >= seatbelt_dref.on
                 seatbelt_auto_logged = false
             end
         end
+    elseif belt.fallback then
+        s.seatbelt = belt.stock_lit()
     end
 
     -- ENGN_running is int[16]; the manual warns that reading past the end of an
@@ -1686,6 +1915,32 @@ local function state_machine()
     end
     if F.done["CrewSeatsLanding"] and finished("CrewSeatsLanding", 10) then
         once("CallCabinSecureLanding", "cabin secure")
+    end
+
+    -- Every move of the sign is written down, whatever comes of it.  Without it
+    -- a report saying "I flipped the switch and nothing happened" cannot be told
+    -- from a wrong dataref: both look like a log with no seat belt line in it.
+    -- The rule below is untouched by this - it only gets explained, and the
+    -- tracker is deliberately separate from F.seatbelt_prev, which is updated in
+    -- the air alone and decides when the announcement fires.
+    if s.seatbelt ~= nil and s.seatbelt ~= belt.note_prev then
+        local from = belt.note_prev
+        belt.note_prev = s.seatbelt
+        if from == nil then
+            log("табло ремней: %s (первое чтение)", s.seatbelt and "горит" or "погашено")
+        elseif not s.seatbelt then
+            log("табло ремней: погашено")
+        elseif s.on_ground then
+            log("табло ремней: горит - объявления не будет, самолёт на земле")
+        elseif s.agl_ft <= 5000 then
+            log("табло ремней: горит - объявления не будет, %d футов над землёй из нужных 5000",
+                round(s.agl_ft))
+        elseif sim_clock - F.last_seatbelt <= 180 then
+            log("табло ремней: горит - объявления не будет, с прошлого прошло %d с из 180",
+                round(sim_clock - F.last_seatbelt))
+        else
+            log("табло ремней: горит")
+        end
     end
 
     -- seatbelt sign PA works in every airborne phase
@@ -2372,11 +2627,22 @@ local function tick_body()
     if not F then return end
     read_sim()
 
+    -- Both of these must keep working while the sim is paused: that is exactly
+    -- when somebody sits on the stand and clicks the switch to see what happens.
+    belt.search_step()
+    belt.probe.poll()
+
     if frozen_reason then return end
 
     if XA_LIVERY_PATH ~= last_livery then
         last_livery = XA_LIVERY_PATH
         forget_sounds()          -- the FMOD banks are rebuilt with the aircraft
+        -- A livery change is as close as this branch gets to "the aeroplane may
+        -- have changed": its datarefs go with it, so the hunt starts over.
+        for _, c in ipairs(SEATBELT_CANDIDATES) do forget_dref(c.name) end
+        belt.bind(false)
+        belt.search_begin()
+        belt.probe.build()
         resolve_airline()
         log("airline: %s (%s), pack %s", current_airline.code,
             current_airline.source, current_airline.pack)
@@ -2929,7 +3195,9 @@ local function draw_settings_tab()
     imgui.SameLine()
     if imgui.Button("Use##sb", 70, 20) then
         config_save()
-        seatbelt_dref = first_seatbelt()
+        forget_dref(cfg.seatbelt_dref)
+        belt.bind(true)
+        belt.search_begin()
         log("seatbelt dataref: %s", seatbelt_dref and seatbelt_dref.name or "none")
     end
 
@@ -3215,7 +3483,9 @@ local LIBRARY_GUESSES = {
     with_slash(SYSTEM_DIRECTORY or "") .. "UA_Sounds",
 }
 
-seatbelt_dref = first_seatbelt()
+belt.bind(true)
+belt.search_begin()
+belt.probe.build()
 logo_dref  = first_dref(LOGO_CANDIDATES)
 clock_dref = first_dref(CLOCK_DREFS)
 
