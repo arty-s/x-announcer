@@ -83,6 +83,22 @@ Local time        cabin local time and the part of day: morning,
 Seatbelt sign     ON / off plus the dataref in use; "not available" means
                   this aircraft exposes no seatbelt sign and the seatbelt
                   calls will not fire
+
+Below it there is a line per trigger: beacon, nav lights, strobes, landing
+and taxi lights, logo light, battery, park brake, distance to destination.
+Each says what it reads and which dataref it reads it from.
+
+"unknown" is not a fault. X-Plane's own switch datarefs always exist, and on
+a study-level add-on with its own electrical system they stay at zero for the
+whole flight: not "no such thing" but "off", forever. So a stock dataref only
+counts once it has been seen lit or seen to move; until then the honest answer
+is "unknown", and the script routes around such a condition instead of waiting
+for it. Lining up, for instance, is strobes OR landing lights OR simply
+rolling faster than 40 knots.
+
+"publishes nothing" means this aircraft does not expose that switch. If that
+matters, name the dataref yourself: signals.ini next to the script, with a
+sample inside. The log names candidates on the probe: lines.
 cabin quiet       nothing is playing
 queued: N         N calls waiting
 background        background music is playing

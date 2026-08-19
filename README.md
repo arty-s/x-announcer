@@ -253,6 +253,67 @@ Every callback runs inside `pcall`, because a Lua error in a FlyWithLua callback
 stops the whole Lua engine — every other script in the sim goes down with it —
 and nothing this plugin does is worth that.
 
+## Triggers: what the script watches
+
+Every announcement hangs off nine readings from the aeroplane: beacon,
+navigation lights, strobes, landing and taxi lights, logo light, battery, park
+brake, seat belt sign. Plus the distance left to fly, which is what the "half
+way" and "three quarters" calls are based on.
+
+The catch is that **X-Plane's own switch datarefs always exist**. Ask a
+study-level add-on with its own electrical system for the beacon and you get a
+confident zero for the whole flight: not "no such thing", but "off", forever. A
+condition written as "beacon on" then never comes true, the phase never moves,
+nothing is missing from the log - because nothing was ever due - and from the
+outside that looks exactly like a broken script.
+
+So:
+
+1. **Three answers, not two.** A dataref the aeroplane published counts at once:
+   if it published the name, it drives it. A stock dataref counts only once it
+   has been seen lit or seen to move; until then the honest answer is "unknown".
+2. **Unknown forbids nothing.** If the aeroplane publishes none of the four
+   signs of electrical power, boarding starts anyway, and the window says why.
+3. **Every transition has a path through physics.** Lining up is strobes OR
+   landing lights OR simply rolling faster than 40 knots; a departure starting
+   is the beacon OR the engines running.
+
+The Flight tab now carries a line per signal under Seatbelt sign: what it reads
+and which dataref it reads it from. The same lines go to the log (`triggers:`)
+when the aeroplane loads - those are the ones worth sending if an unfamiliar
+aeroplane stays silent.
+
+The dataref names are not guesses: each was read out of the aeroplane's own
+files. That is also where this came from - **on the FlightFactor 777 the strobe,
+taxi and landing switches are wired the other way up** (`on(0)`, `off(1)`), and
+read the usual way round they would report the strobes lit for exactly as long
+as they are dark.
+
+### signals.ini
+
+`signals.ini` sits next to the script with a sample inside. Most aeroplanes need
+nothing: the script finds them by itself. It is for when a signal line in the
+window says the aeroplane publishes nothing, or reads something other than what
+the cockpit shows. The log names the dataref: with `dataref_probe` on, the script
+watches every name it knows and writes down the ones that move.
+
+```ini
+[B772]
+strobe  = 1-sim/ckpt/strobeLightSwitch/anim on<=0
+taxi    = 1-sim/ckpt/taxiLightSwitch/anim on<=0
+```
+
+The section is the aircraft code as X-Plane reports it, or `*` for all. The
+threshold is `on>=value` or `on<=value`, "1 and above" by default. Signals:
+`beacon`, `nav`, `strobe`, `landing`, `taxi`, `logo`, `battery`, `parkbrake`,
+`seatbelt`, `route_distance`. The format is shared with the v2 branch, so a line
+carries over between them.
+
+FlyWithLua only has `XPLMFindDataRef` - its binary cannot enumerate the
+simulator's datarefs at all. So the probe here watches a list of **known names**
+rather than everything, as v2 does. If the name you need is not on that list, v2
+or a dataref editor will name it.
+
 ## Settings (config.ini)
 
 The file writes itself and every key carries a comment. Edit it with the

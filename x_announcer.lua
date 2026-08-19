@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.2.0"
+local VERSION = "1.2.1"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -502,7 +502,7 @@ end
 local function forget_dref(name)
     if name and name ~= "" then dref_cache[name] = nil end
 end
--- (kept a plain local: it is called from the boot code, before `belt` exists)
+-- (kept a plain local: it is called from the boot code, before `sig` exists)
 
 -- Whole numbers as whole numbers: "2", not "2.000", so a switch position in the
 -- log reads like a switch position.
@@ -1031,7 +1031,7 @@ local SEATBELT_CANDIDATES = {
 -- `stock` is what X-Plane publishes itself.  Used only when the aeroplane
 -- offered nothing, and all of them together: an aeroplane that bothers with
 -- either the annunciator or the stock switch usually drives only one of the two.
-local belt = {
+local sig = {
     stock = {
         SEATBELT_ANNUNCIATOR,
         "sim/cockpit2/switches/fasten_seat_belts",
@@ -1050,11 +1050,352 @@ local belt = {
     gave_up = false,
 }
 
--- X-Plane itself has no logo light dataref; only add-ons provide one.
-local LOGO_CANDIDATES = {
-    "laminar/B738/toggle_switch/logo_light",
-    "Rotate/aircraft/controls/logo_lts",
+----------------------------------------------------------------------------
+-- Every OTHER reading the state machine acts on: the exterior lights, the
+-- battery, the park brake, how far there is left to fly.  They live in the same
+-- table for the same reason the seat belt sign does - the main chunk of a Lua
+-- script may hold 200 locals and this one is at the ceiling.
+--
+-- Two lists per signal, never one.  `own` is what an AEROPLANE publishes under
+-- its own name; `stock_of` is what X-Plane publishes whatever is loaded.  One
+-- stock name among the aircraft candidates would end every search at itself,
+-- which is the mistake that once had a Zibo read through an annunciator its own
+-- systems never write.
+--
+-- And finding a stock name proves nothing.  X-Plane's beacon dataref exists on
+-- a FlightFactor 777 too; it simply reads zero for the whole flight, because
+-- the aeroplane drives its own.  Read as "off" that is a switch nobody ever
+-- turns on, and the whole departure waits for it in silence.  So a stock
+-- binding is PROVISIONAL: it answers "don't know" until it has been seen lit or
+-- seen to move.  A name the aeroplane published needs no such proof - the name
+-- existing is the proof.
+--
+-- The names are not guesses.  Each was read out of the aeroplane's own files:
+-- the datarefs its objects animate, its published dataref list, or its switch
+-- table.
+sig.own = {
+    beacon = {
+        { name = "1-sim/ckpt/beaconLightSwitch/anim" },            -- FlightFactor 777
+        { name = "ckpt/oh/beaconLight/anim" },                     -- ToLiss
+        { name = "Rotate/aircraft/controls/beacon_lts" },          -- MD-11
+        { name = "CL650/overhead/ext_lts/beacon" },
+        { name = "KA350/ianim/pSubpanel/beaconLights" },
+    },
+    nav = {
+        { name = "laminar/B738/toggle_switch/position_light_pos" },
+        { name = "1-sim/ckpt/navLightSwitch/anim" },
+        { name = "Rotate/aircraft/controls/nav_lts" },
+    },
+    -- The 777 wires these three the other way up - on(0), off(1) in its own
+    -- switch table - so read the usual way round they would report the lights
+    -- lit for exactly as long as they are dark, which is the whole taxi out.
+    strobe = {
+        { name = "1-sim/ckpt/strobeLightSwitch/anim", on = 0, at_most = true },
+        { name = "ckpt/oh/strobeLight/anim" },
+        { name = "Rotate/aircraft/controls/strobe_lts" },
+        { name = "KA350/ianim/pSubpanel/strobeLights" },
+    },
+    landing = {
+        { name = "1-sim/ckpt/landingLightNoseSwitch/anim", on = 0, at_most = true },
+        { name = "1-sim/ckpt/landingLightLeftSwitch/anim", on = 0, at_most = true },
+        { name = "laminar/B738/switch/land_lights_left_pos" },
+    },
+    taxi = {
+        { name = "1-sim/ckpt/taxiLightSwitch/anim", on = 0, at_most = true },
+        { name = "laminar/B738/toggle_switch/taxi_light_brightness_pos" },
+    },
+    -- X-Plane itself publishes no logo light; only add-ons do, which is why
+    -- this one has no stock fallback at all.
+    logo = {
+        { name = "laminar/B738/toggle_switch/logo_light" },
+        { name = "Rotate/aircraft/controls/logo_lts" },
+        { name = "1-sim/ckpt/logoLightSwitch/anim" },
+        { name = "CL650/overhead/ext_lts/logo" },
+    },
+    battery = {
+        { name = "1-sim/ckpt/batteryButton/anim" },
+    },
+    parkbrake = {
+        { name = "1-sim/ckpt/parkbrake/anim" },
+        { name = "laminar/B738/parking_brake_pos", on = 0.5 },
+        { name = "Rotate/aircraft/controls/park_brake", on = 0.5 },
+        { name = "ckpt/parkbrk", on = 0.5 },
+        { name = "CL650/pedestal/park_brake", on = 0.5 },
+    },
+    -- The stock FMS is empty on every add-on with a real FMC: a Zibo's route
+    -- lives in the Zibo.  Where the aeroplane publishes the remaining distance
+    -- itself, that is the only honest source for "half the route flown".
+    route_distance = {
+        { name = "laminar/B738/FMS/dist_dest" },
+    },
 }
+
+sig.stock_of = {
+    beacon    = "sim/cockpit2/switches/beacon_on",
+    nav       = "sim/cockpit2/switches/navigation_lights_on",
+    strobe    = "sim/cockpit2/switches/strobe_lights_on",
+    landing   = "sim/cockpit2/switches/landing_lights_on",
+    taxi      = "sim/cockpit2/switches/taxi_light_on",
+    battery   = "sim/cockpit2/electrical/battery_on",
+    parkbrake = "sim/flightmodel/controls/parkbrake",
+}
+
+-- Panel order, and the order of the lines in the log.  Departure first: that is
+-- the half that goes quiet when a trigger is missing.
+sig.order = { "beacon", "nav", "strobe", "landing", "taxi", "logo",
+              "battery", "parkbrake", "route_distance" }
+
+sig.titles = {
+    beacon = "Маяк", nav = "АНО", strobe = "Стробы", landing = "Посадочные фары",
+    taxi = "Рулёжные фары", logo = "Подсветка киля", battery = "Батарея",
+    parkbrake = "Стояночный тормоз", route_distance = "До точки назначения",
+}
+
+sig.bound = {}      -- key -> { name, on, at_most, own, provisional, last, moved, meaningful }
+sig.overrides = {}  -- ICAO (or "*") -> list of { signal, dataref, on, at_most }
+sig.icao = ""       -- what the aeroplane calls itself; signals.ini is keyed on it
+sig.path = BASE_DIR .. "signals.ini"
+
+-- What is written out when there is no file yet.  It has to teach the format
+-- without the README: the person reading it has just been told "add a line to
+-- signals.ini" and is looking at an empty folder.
+sig.sample = [[
+# Здесь можно назвать датарефы борта, которых скрипт ещё не знает.
+# Он ищет их сам, и для большинства самолётов этот файл не нужен вовсе.
+# Нужен он тогда, когда в журнале строка triggers: говорит «этот борт ничего
+# такого не публикует» либо читается не то, что видно в кабине.
+#
+# Что писать, подсказывает журнал: включите dataref_probe в config.ini,
+# щёлкните тумблером в кабине и найдите строку probe: с именем датарефа.
+#
+# Раздел - код борта из X-Plane (B738, B772, A20N) либо * для всех.
+# Строка - сигнал = датареф [on>=значение | on<=значение].
+# По умолчанию "включено" - это значение 1 и выше.
+#
+# Сигналы: beacon, nav, strobe, landing, taxi, logo, battery,
+#          parkbrake, seatbelt, route_distance.
+#
+# Пример - FlightFactor 777, у которого три тумблера перевёрнуты:
+# [B772]
+# strobe  = 1-sim/ckpt/strobeLightSwitch/anim on<=0
+# taxi    = 1-sim/ckpt/taxiLightSwitch/anim on<=0
+# landing = 1-sim/ckpt/landingLightNoseSwitch/anim on<=0
+]]
+
+-- The number behind a binding, whichever way the aeroplane publishes it.  Some
+-- aircraft expose a switch position as a float and nothing else, and asking such
+-- a dataref for an int gives a confident zero.
+function sig.raw(name)
+    local ref = find_dref(name)
+    if not ref then return nil end
+    local value = XPLMGetDatai(ref)
+    if value == 0 then
+        local as_float = XPLMGetDataf(ref)
+        if as_float then value = as_float end
+    end
+    return value
+end
+
+function sig.lit(b, value)
+    if b.at_most then return value <= b.on + 0.001 end
+    return value >= b.on - 0.001
+end
+
+-- Binds one signal: the user's signals.ini first, then the aeroplane's own
+-- names, then whatever X-Plane publishes.  Returns true when the binding moved.
+function sig.bind_one(key, announce)
+    local was = sig.bound[key]
+    local fresh = nil
+
+    local function try(name, on, at_most, own)
+        if fresh or not name or name == "" then return end
+        if not find_dref(name) then return end
+        fresh = { name = name, on = on or 1, at_most = at_most or false,
+                  own = own, provisional = not own }
+    end
+
+    for _, entry in ipairs(sig.overrides_for()) do
+        if entry.signal == key then try(entry.dataref, entry.on, entry.at_most, true) end
+    end
+    for _, c in ipairs(sig.own[key] or {}) do try(c.name, c.on, c.at_most, true) end
+    try(sig.stock_of[key], key == "parkbrake" and 0.5 or 1, false, false)
+
+    local changed = (was == nil) ~= (fresh == nil)
+    if was and fresh and (was.name ~= fresh.name or was.own ~= fresh.own) then changed = true end
+    if changed then sig.bound[key] = fresh end
+    if announce or changed then
+        local b = sig.bound[key]
+        if not b then
+            log("triggers: %s - этот борт ничего такого не публикует", key)
+        else
+            log("triggers: %s = %s%s", key, b.name,
+                b.own and " (датареф борта)" or " (штатный - жду, пока он шевельнётся)")
+        end
+    end
+    return changed
+end
+
+function sig.bind_signals(announce)
+    for _, key in ipairs(sig.order) do sig.bind_one(key, announce) end
+end
+
+-- Anything still worth looking for: nothing bound, or bound to a stock name
+-- while the aeroplane might yet publish its own.
+function sig.pending()
+    for _, key in ipairs(sig.order) do
+        local b = sig.bound[key]
+        if not b or not b.own then return true end
+    end
+    return false
+end
+
+function sig.retry_signals()
+    for _, key in ipairs(sig.order) do
+        local b = sig.bound[key]
+        if not b or not b.own then
+            for _, c in ipairs(sig.own[key] or {}) do forget_dref(c.name) end
+            sig.bind_one(key, false)
+        end
+    end
+end
+
+-- Three answers, and the third one is not "off": nil means "this aeroplane
+-- gives us no way to ask".  Every condition in the state machine is written so
+-- that nil can never FORBID anything.
+function sig.read(key)
+    local b = sig.bound[key]
+    if not b then return nil end
+    local value = sig.raw(b.name)
+    if value == nil then return nil end
+    local lit = sig.lit(b, value)
+    if b.last == nil then
+        b.last = value
+        if lit then b.meaningful = true end
+    elseif math.abs(value - b.last) > 0.0005 then
+        b.last = value
+        b.moved = true
+        b.meaningful = true
+    end
+    if b.provisional and not b.meaningful then return nil end
+    return lit
+end
+
+-- The raw number, for the signal that is a measurement rather than a switch.
+function sig.number(key)
+    local b = sig.bound[key]
+    if not b then return nil end
+    local value = sig.raw(b.name)
+    if value ~= nil then b.last = value end
+    return value
+end
+
+-- The whole table as log lines.  Written when the aeroplane settles and again
+-- on request, so that a report from an untested aeroplane says which of its
+-- triggers are alive without a second round of questions.
+function sig.lines()
+    local out = {}
+    for _, key in ipairs(sig.order) do
+        local b = sig.bound[key]
+        local reading
+        if key == "route_distance" then
+            local nm = sig.number(key)
+            if nm and nm > 0.1 then
+                reading = fmt_num(nm) .. " nm"
+            else
+                reading = "не знаю"
+            end
+        else
+            local value = sig.read(key)
+            if value == nil then
+                reading = "не знаю"
+            elseif value then
+                reading = "вкл"
+            else
+                reading = "выкл"
+            end
+        end
+        if not b then
+            out[#out + 1] = string.format("triggers: %s = (нет) [не найден] -> %s", key, reading)
+        else
+            out[#out + 1] = string.format("triggers: %s = %s [%s] знач %s, %s -> %s",
+                key, b.name, b.own and "борт" or "штатный",
+                fmt_num(b.last or 0), b.moved and "двигался" or "не двигался", reading)
+        end
+    end
+    return out
+end
+
+function sig.log_table(why)
+    log("triggers: %s", why)
+    for _, line in ipairs(sig.lines()) do log("%s", line) end
+end
+
+----------------------------------------------------------------------------
+-- signals.ini - how a person teaches this script an aeroplane nobody has
+-- opened, without waiting for a release.  The probe names the dataref in the
+-- log; one line here binds it.  Same file and same format as v2.
+function sig.overrides_for()
+    local out = {}
+    local mine = sig.overrides[((sig.icao ~= "" and sig.icao) or PLANE_ICAO or ""):upper()]
+    if mine then for _, e in ipairs(mine) do out[#out + 1] = e end end
+    local any = sig.overrides["*"]
+    if any then for _, e in ipairs(any) do out[#out + 1] = e end end
+    return out
+end
+
+function sig.load_overrides()
+    sig.overrides = {}
+    local f = io.open(sig.path, "r")
+    if not f then
+        -- Written out once, so the format is discoverable from the folder the
+        -- script lives in rather than only from the README.
+        local sample = io.open(sig.path, "w")
+        if sample then
+            sample:write(sig.sample)
+            sample:close()
+        end
+        return
+    end
+    local section, count, number = "*", 0, 0
+    for line in f:lines() do
+        number = number + 1
+        local body = line:gsub("^%s+", ""):gsub("%s+$", "")
+        local first = body:sub(1, 1)
+        if body ~= "" and first ~= "#" and first ~= ";" then
+            local head = body:match("^%[([^%]]*)%]$")
+            if head then
+                section = head:upper()
+                if section == "" then section = "*" end
+            elseif first == "[" then
+                log("signals.ini: строка %d: скобка [ не закрыта", number)
+            else
+                local key, rest = body:match("^([%w_]+)%s*=%s*(.+)$")
+                local lower = key and key:lower() or nil
+                if not key then
+                    log("signals.ini: строка %d: нет знака =", number)
+                elseif not (sig.own[lower] or lower == "seatbelt") then
+                    log("signals.ini: строка %d: нет такого сигнала - %s", number, key)
+                else
+                    local dref = rest:match("^(%S+)")
+                    local on, at_most = 1, false
+                    local op, value = rest:match("on%s*([<>]?=)%s*([%d%.%-]+)")
+                    if op then
+                        on = tonumber(value) or 1
+                        at_most = op == "<="
+                    elseif rest:match("%son%S") then
+                        log("signals.ini: строка %d: ожидалось on>=число или on<=число", number)
+                    end
+                    sig.overrides[section] = sig.overrides[section] or {}
+                    table.insert(sig.overrides[section],
+                        { signal = lower, dataref = dref, on = on, at_most = at_most })
+                    count = count + 1
+                end
+            end
+        end
+    end
+    f:close()
+    if count > 0 then log("signals.ini: %d своих датарефов", count) end
+end
 
 local function first_seatbelt()
     if cfg.seatbelt_dref ~= "" and find_dref(cfg.seatbelt_dref) then
@@ -1066,22 +1407,24 @@ local function first_seatbelt()
     return nil
 end
 
-local seatbelt_dref, logo_dref = nil, nil
+-- The logo light used to have a candidate list of its own here.  It lives in
+-- sig.own now, with the other eight signals and the same three-valued answer.
+local seatbelt_dref = nil
 -- Said once per hand-over, not every frame.
 local seatbelt_auto_logged = false
 
 -- What the aeroplane does with a switch left in AUTO.  Taken from the 737's own
 -- cabin logic rather than invented: the sign is lit with flaps out or the gear
 -- down - departure and arrival - and deployed masks override the lot.
-function belt.auto_lit()
+function sig.auto_lit()
     if geti("sim/operation/failures/rel_pass_o2_on", 0) == 6 then return true end
     if getf("sim/cockpit2/controls/flap_ratio", 0) > 0.01 then return true end
     return geti("sim/cockpit2/controls/gear_handle_down", 0) == 1
 end
 
 -- Reads the stock datarefs, whichever of them this aeroplane bothers with.
-function belt.stock_lit()
-    for _, name in ipairs(belt.stock) do
+function sig.stock_lit()
+    for _, name in ipairs(sig.stock) do
         if geti(name, 0) == 1 then return true end
     end
     return false
@@ -1090,14 +1433,14 @@ end
 -- Binds the sign, telling apart "found the aeroplane's own" from "fell back to
 -- stock".  Announces only when something changed, so the retry is silent until
 -- it has news.
-function belt.bind(announce)
+function sig.bind(announce)
     local was = seatbelt_dref and seatbelt_dref.name or nil
     seatbelt_dref = first_seatbelt()
     seatbelt_auto_logged = false
-    belt.fallback = seatbelt_dref == nil
+    sig.fallback = seatbelt_dref == nil
     local now = seatbelt_dref and seatbelt_dref.name or "штатные датарефы X-Plane"
     if announce or now ~= was then
-        if belt.fallback then
+        if sig.fallback then
             log("datarefs: seatbelt %s - ничего своего у борта пока не нашлось, ищу дальше", now)
         else
             log("datarefs: seatbelt %s", now)
@@ -1110,7 +1453,7 @@ end
 -- sign, this branch can only watch the names it already knows.  That is still
 -- the difference between "the switch does nothing" and "THIS is the dataref the
 -- switch moves": the user flips it, sends the log, and the line names it.
-belt.probe_extra = {
+sig.probe_extra = {
     "laminar/B738/toggle_switch/no_smoking_pos",
     "laminar/b738/fmodpack/play_belts",
     "AirbusFBW/NoSmokingSignsOn",
@@ -1121,9 +1464,9 @@ belt.probe_extra = {
     "sim/cockpit/switches/no_smoking",
 }
 
-belt.probe = { watch = nil, lines = 0, next = 0, max_lines = 120 }
+sig.probe = { watch = nil, lines = 0, next = 0, max_lines = 120 }
 
-function belt.probe.names()
+function sig.probe.names()
     local names, seen = {}, {}
     local function add(name)
         if name and name ~= "" and not seen[name] then
@@ -1133,37 +1476,45 @@ function belt.probe.names()
     end
     add(cfg.seatbelt_dref)
     for _, c in ipairs(SEATBELT_CANDIDATES) do add(c.name) end
-    for _, n in ipairs(belt.stock) do add(n) end
-    for _, n in ipairs(belt.probe_extra) do add(n) end
+    for _, n in ipairs(sig.stock) do add(n) end
+    for _, n in ipairs(sig.probe_extra) do add(n) end
+    -- The lights, the battery, the park brake and the distance to destination
+    -- too.  Signs alone were not enough: on an aeroplane that keeps its beacon
+    -- to itself the whole departure goes quiet, and in a log that looks exactly
+    -- like a wrong seat belt dataref did.
+    for _, list in pairs(sig.own) do
+        for _, c in ipairs(list) do add(c.name) end
+    end
+    for _, n in pairs(sig.stock_of) do add(n) end
     return names
 end
 
 -- Builds the watch list out of the names this aeroplane actually has, and says
 -- what each one reads right now: half the reports arrive with the switch exactly
 -- where the user left it, and then the starting values are the only evidence.
-function belt.probe.build()
-    belt.probe.watch = {}
+function sig.probe.build()
+    sig.probe.watch = {}
     if not cfg.dataref_probe then return end
-    for _, name in ipairs(belt.probe.names()) do
+    for _, name in ipairs(sig.probe.names()) do
         if find_dref(name) then
             local value = getf(name, 0)
-            belt.probe.watch[#belt.probe.watch + 1] = { name = name, value = value, changes = 0 }
-            if belt.probe.lines < belt.probe.max_lines then
-                belt.probe.lines = belt.probe.lines + 1
+            sig.probe.watch[#sig.probe.watch + 1] = { name = name, value = value, changes = 0 }
+            if sig.probe.lines < sig.probe.max_lines then
+                sig.probe.lines = sig.probe.lines + 1
                 log("probe: %s = %s", name, fmt_num(value))
             end
         end
     end
-    if #belt.probe.watch > 0 then
-        log("probe: под наблюдением %d датарефов про ремни и знаки", #belt.probe.watch)
+    if #sig.probe.watch > 0 then
+        log("probe: под наблюдением %d датарефов", #sig.probe.watch)
     end
 end
 
-function belt.probe.poll()
-    if not cfg.dataref_probe or not belt.probe.watch then return end
-    if real_clock < belt.probe.next then return end
-    belt.probe.next = real_clock + 0.25
-    for _, w in ipairs(belt.probe.watch) do
+function sig.probe.poll()
+    if not cfg.dataref_probe or not sig.probe.watch then return end
+    if real_clock < sig.probe.next then return end
+    sig.probe.next = real_clock + 0.25
+    for _, w in ipairs(sig.probe.watch) do
         if not w.dropped then
             local now = getf(w.name, 0)
             if math.abs(now - w.value) >= 0.0005 then
@@ -1173,8 +1524,8 @@ function belt.probe.poll()
                 if w.changes > 12 then
                     w.dropped = true
                     log("probe: %s меняется непрерывно - снимаю с наблюдения", w.name)
-                elseif belt.probe.lines < belt.probe.max_lines then
-                    belt.probe.lines = belt.probe.lines + 1
+                elseif sig.probe.lines < sig.probe.max_lines then
+                    sig.probe.lines = sig.probe.lines + 1
                     log("probe: %s %s -> %s", w.name, fmt_num(was), fmt_num(now))
                 end
             end
@@ -1187,27 +1538,37 @@ end
 -- decides nothing.  The search keeps going for two minutes, and the negative
 -- answers cached by find_dref are thrown away first - otherwise a dataref that
 -- appears late would stay "missing" for the rest of the session.
-function belt.search_begin()
-    belt.search_until = real_clock + 120
-    belt.next_retry = 0
-    belt.gave_up = false
+function sig.search_begin()
+    sig.search_until = real_clock + 120
+    sig.next_retry = 0
+    sig.gave_up = false
 end
 
-function belt.search_step()
-    if not belt.fallback or belt.gave_up then return end
-    if real_clock >= belt.search_until then
-        belt.gave_up = true
-        log("datarefs: за две минуты этот борт не опубликовал своего датарефа табло ремней - "
-            .. "читаю штатные. Если табло живёт своей жизнью, пришлите журнал: строки probe: "
-            .. "назовут датареф, которым оно управляется")
+function sig.search_step()
+    if sig.gave_up then return end
+    if real_clock >= sig.search_until or not (sig.fallback or sig.pending()) then
+        sig.gave_up = true
+        -- The whole table, once, when the aeroplane has stopped arriving.  This
+        -- is the line a report is worth sending for: it says which triggers the
+        -- aeroplane actually gives us and which ones we are deaf to, without
+        -- another round of questions.
+        sig.log_table("что этот борт даёт нам читать")
+        if sig.fallback then
+            log("datarefs: своего датарефа табло ремней этот борт не дал - читаю штатные. "
+                .. "Если табло живёт своей жизнью, пришлите журнал: строки probe: "
+                .. "назовут датареф, которым оно управляется")
+        end
         return
     end
-    if real_clock < belt.next_retry then return end
-    belt.next_retry = real_clock + 2
-    for _, c in ipairs(SEATBELT_CANDIDATES) do forget_dref(c.name) end
-    if cfg.seatbelt_dref ~= "" then forget_dref(cfg.seatbelt_dref) end
-    belt.bind(false)
-    if not belt.fallback then belt.probe.build() end
+    if real_clock < sig.next_retry then return end
+    sig.next_retry = real_clock + 2
+    if sig.fallback then
+        for _, c in ipairs(SEATBELT_CANDIDATES) do forget_dref(c.name) end
+        if cfg.seatbelt_dref ~= "" then forget_dref(cfg.seatbelt_dref) end
+        sig.bind(false)
+        if not sig.fallback then sig.probe.build() end
+    end
+    sig.retry_signals()
 end
 
 -- Where the cabin marks the progress of the flight.  The fractions are written
@@ -1216,6 +1577,11 @@ end
 -- untrue.  Below the floor the marks are meaningless - on a 40 nm hop half the
 -- route is behind you while the gear is still coming up.
 local CRUISE_MIN_NM = 150
+
+-- Fast enough on the ground that nothing but a take-off roll is happening.  Well
+-- above any taxi speed and well below rotation, so the call lands where the
+-- lights would have put it rather than at V1.
+local ROLLING_KT = 40
 
 -- Great-circle distance in nautical miles.  A flat approximation would be tens
 -- of miles out on the routes where "half way" is worth announcing at all, and
@@ -1290,16 +1656,19 @@ local function read_sim()
     s.alt_ft        = getf("sim/flightmodel/misc/h_ind", 0)
     s.vs_fpm        = getf("sim/flightmodel/position/vh_ind_fpm", 0)
     s.g_normal      = getf("sim/flightmodel/forces/g_nrml", 1)
-    s.beacon        = geti("sim/cockpit2/switches/beacon_on", 0) == 1
-    s.nav_lights    = geti("sim/cockpit2/switches/navigation_lights_on", 0) == 1
-    s.strobe        = geti("sim/cockpit2/switches/strobe_lights_on", 0) == 1
-    s.landing_light = geti("sim/cockpit2/switches/landing_lights_on", 0) == 1
-    s.taxi_light    = geti("sim/cockpit2/switches/taxi_light_on", 0) == 1
-    s.parkbrake     = getf("sim/flightmodel/controls/parkbrake", 0) > 0.5
-    s.battery       = geti("sim/cockpit2/electrical/battery_on", 0) == 1
-
-    s.logo = false
-    if logo_dref then s.logo = geti(logo_dref, 0) == 1 end
+    -- true, false or NIL, and the nil matters: it means this aeroplane gives us
+    -- no way to ask.  Lua's own truth rules then do exactly the right thing -
+    -- `s.beacon` is "the beacon is on", `not s.beacon` is "the beacon is not
+    -- known to be on" - so every gate below reads correctly without a special
+    -- case, and a switch we cannot see can never hold a phase up.
+    s.beacon        = sig.read("beacon")
+    s.nav_lights    = sig.read("nav")
+    s.strobe        = sig.read("strobe")
+    s.landing_light = sig.read("landing")
+    s.taxi_light    = sig.read("taxi")
+    s.parkbrake     = sig.read("parkbrake")
+    s.battery       = sig.read("battery")
+    s.logo          = sig.read("logo")
 
     s.seatbelt = nil
     if seatbelt_dref then
@@ -1323,8 +1692,8 @@ local function read_sim()
             -- the aeroplane's own rule, flaps and gear.
             if seatbelt_dref.auto and value == seatbelt_dref.auto then
                 local sign_lit = geti(SEATBELT_ANNUNCIATOR, 0) == 1
-                if sign_lit then belt.sign_seen_lit = true end
-                if seatbelt_dref.rule == "sign_then_flaps" and belt.sign_seen_lit then
+                if sign_lit then sig.sign_seen_lit = true end
+                if seatbelt_dref.rule == "sign_then_flaps" and sig.sign_seen_lit then
                     s.seatbelt = sign_lit
                     if not seatbelt_auto_logged then
                         seatbelt_auto_logged = true
@@ -1332,7 +1701,7 @@ local function read_sim()
                             SEATBELT_ANNUNCIATOR)
                     end
                 else
-                    s.seatbelt = belt.auto_lit()
+                    s.seatbelt = sig.auto_lit()
                     if not seatbelt_auto_logged then
                         seatbelt_auto_logged = true
                         log("seatbelt switch is in AUTO - самолёт решает сам, беру табло по "
@@ -1344,8 +1713,8 @@ local function read_sim()
                 seatbelt_auto_logged = false
             end
         end
-    elseif belt.fallback then
-        s.seatbelt = belt.stock_lit()
+    elseif sig.fallback then
+        s.seatbelt = sig.stock_lit()
     end
 
     -- ENGN_running is int[16]; the manual warns that reading past the end of an
@@ -1367,6 +1736,14 @@ local function read_sim()
     s.lon = getd("sim/flightmodel/position/longitude", 0)
     s.dest_lat, s.dest_lon = fms_destination()
     s.route_known = s.dest_lat ~= nil
+    -- The aeroplane's own figure first.  An add-on with a real FMC leaves the
+    -- stock FMS empty, so on exactly the aircraft people fly long routes in,
+    -- fms_destination() finds nothing at all.  Zero is "no route entered", not
+    -- "we have arrived": the FMC publishes zero right through the turnaround.
+    s.route_dist_nm = nil
+    local own_dist = sig.number("route_distance")
+    if own_dist and own_dist > 0.1 then s.route_dist_nm = own_dist end
+    s.have_route = s.route_dist_nm ~= nil or s.route_known
 
     local local_sec = getf("sim/time/local_time_sec", 43200)
     s.local_hour = math.floor((local_sec % 86400) / 3600)
@@ -1762,11 +2139,19 @@ local POWER_SIGNS = {
 }
 
 local function aircraft_powered(s)
-    local on = {}
+    local on, any_known = {}, false
     for _, sign in ipairs(POWER_SIGNS) do
-        if sign.read(s) then on[#on + 1] = sign.name end
+        local value = sign.read(s)
+        if value ~= nil then any_known = true end
+        if value then on[#on + 1] = sign.name end
     end
-    return #on > 0, on
+    -- Not one of the four exists on this aeroplane.  That is not "the aeroplane
+    -- is dead", it is "we have no way to ask", and the two must not give the
+    -- same answer.  Answering "no power" here is what keeps a FlightFactor 777
+    -- parked in PREFLIGHT for a whole flight: boarding never opens, so nothing
+    -- that follows boarding is ever due, and the log stays clean while the cabin
+    -- stays silent.  The panel says which of the two answers this is.
+    return #on > 0 or not any_known, on, not any_known
 end
 
 local function state_machine()
@@ -1781,7 +2166,12 @@ local function state_machine()
                 once("BoardingStarted", "cabin ready")
             end
         end
-        if s.on_ground and s.any_engine and s.beacon then
+        -- Either sign of a departure, not both.  This used to be an AND, and on
+        -- an aeroplane with no stock beacon that AND could never be true: the
+        -- engines could be running, the aeroplane taxiing, and the machine still
+        -- sat in PREFLIGHT waiting for a lamp nobody drives.  BOARDING has read
+        -- the same two conditions as OR since the beginning.
+        if s.on_ground and (s.any_engine or s.beacon) then
             -- script loaded with engines already running
             set_phase("PUSHBACK")
         elseif not s.on_ground then
@@ -1819,7 +2209,11 @@ local function state_machine()
 
         if s.beacon or s.any_engine then
             stop_music()
-            once("BoardingComplete", "beacon on")
+            -- Say which of the two it was.  "beacon on" printed over an
+            -- aeroplane that has no beacon is the kind of line that sends
+            -- somebody looking for a fault in the wrong place.
+            local why = s.beacon and "beacon on" or "engine started"
+            once("BoardingComplete", why)
             set_phase("PUSHBACK")
         end
     end
@@ -1839,12 +2233,21 @@ local function state_machine()
         if cfg.night_dim and s.is_dark and finished("SafetyBriefing", 10) then
             once("CabinDimTakeoff", "night departure")
         end
-        if s.on_ground and s.any_engine and (s.strobe or s.landing_light) then
+        -- Lights are how a crew says "we are going", and they are the earliest
+        -- signal there is - but they are also the signal an add-on is most
+        -- likely to keep to itself.  The take-off roll is not: ground speed
+        -- comes from the flight model and exists on every aeroplane ever loaded.
+        -- So the lights stay as the nice early path and the roll is the
+        -- guarantee, otherwise "cabin crew, take your seats" is simply never
+        -- said on a FlightFactor.
+        local lined_up = s.strobe or s.landing_light
+        if s.on_ground and s.any_engine and (lined_up or s.gs_kt > ROLLING_KT) then
             -- The phase moves whether or not there is a file to play.  Until
             -- 2026-07-28 this and the disembark transition were gated on the
             -- announcement actually going on the air, so a pack missing one file
             -- stalled the machine - harmless here, but fatal on the stand.
-            once("CrewSeatsTakeoff", "lined up")
+            local why = lined_up and "lined up" or "rolling"
+            once("CrewSeatsTakeoff", why)
             set_phase("TAKEOFF")
         end
         if not s.on_ground then set_phase("TAKEOFF") end
@@ -1875,16 +2278,17 @@ local function state_machine()
 
     -- The route is measured once, as soon as we are airborne and there is a plan
     -- to measure.  On the ground it would be wrong by the length of the taxi.
-    if not s.on_ground and s.route_known and not F.route_total_nm then
-        F.route_total_nm = distance_nm(s.lat, s.lon, s.dest_lat, s.dest_lon)
-        log("route: %.0f nm to the last point of the plan", F.route_total_nm)
+    if not s.on_ground and s.have_route and not F.route_total_nm then
+        F.route_total_nm = s.route_dist_nm or distance_nm(s.lat, s.lon, s.dest_lat, s.dest_lon)
+        log("route: %.0f nm to the last point of the plan%s", F.route_total_nm,
+            s.route_dist_nm and " (по счислению самого борта)" or "")
     end
 
     if F.phase == "CRUISE" then
         -- How much of the route is behind us.  A jump past both marks announces
         -- only the later one: "half way" after three quarters is a lie.
-        if s.route_known and F.route_total_nm and F.route_total_nm >= CRUISE_MIN_NM then
-            local remaining = distance_nm(s.lat, s.lon, s.dest_lat, s.dest_lon)
+        if s.have_route and F.route_total_nm and F.route_total_nm >= CRUISE_MIN_NM then
+            local remaining = s.route_dist_nm or distance_nm(s.lat, s.lon, s.dest_lat, s.dest_lon)
             local flown = 1 - remaining / F.route_total_nm
             if flown >= 0.75 then
                 once("CruiseElapsed75Percent", "three quarters of the route flown")
@@ -1923,9 +2327,9 @@ local function state_machine()
     -- The rule below is untouched by this - it only gets explained, and the
     -- tracker is deliberately separate from F.seatbelt_prev, which is updated in
     -- the air alone and decides when the announcement fires.
-    if s.seatbelt ~= nil and s.seatbelt ~= belt.note_prev then
-        local from = belt.note_prev
-        belt.note_prev = s.seatbelt
+    if s.seatbelt ~= nil and s.seatbelt ~= sig.note_prev then
+        local from = sig.note_prev
+        sig.note_prev = s.seatbelt
         if from == nil then
             log("табло ремней: %s (первое чтение)", s.seatbelt and "горит" or "погашено")
         elseif not s.seatbelt then
@@ -2044,16 +2448,22 @@ local function phase_conditions()
         -- can see, or - when it sees none - which ones it is watching.  On an
         -- aircraft whose battery switch never reaches X-Plane that is the
         -- difference between "flip the nav lights" and "the plugin is broken".
-        local powered, on = aircraft_powered(s)
+        local powered, on, blind = aircraft_powered(s)
         local reading
-        if powered then
+        if blind then
+            -- Met, but for a reason the person has to be told: this aeroplane
+            -- publishes none of the four, so the condition is waved through
+            -- rather than satisfied.  Without the note the panel would claim to
+            -- have seen a battery that does not exist.
+            reading = "this aircraft publishes none - not waiting for it"
+        elseif powered then
             reading = table.concat(on, " + ")
         else
             local watched = {}
             for _, sign in ipairs(POWER_SIGNS) do
                 -- Only add-ons publish a logo light; do not name one that is
                 -- not there to be switched.
-                if sign.name ~= "logo" or logo_dref then
+                if sign.name ~= "logo" or sig.bound["logo"] then
                     watched[#watched + 1] = sign.name
                 end
             end
@@ -2072,7 +2482,8 @@ local function phase_conditions()
     elseif p == "PUSHBACK" then
         return "Takeoff", {
             yes("engine running",           s.any_engine),
-            yes("strobes / landing lights", s.strobe or s.landing_light),
+            yes("strobes / landing lights or rolling",
+                s.strobe or s.landing_light or s.gs_kt > ROLLING_KT, ft(s.gs_kt) .. " kt"),
         }
     elseif p == "TAKEOFF" then
         return "Climb", {
@@ -2629,8 +3040,8 @@ local function tick_body()
 
     -- Both of these must keep working while the sim is paused: that is exactly
     -- when somebody sits on the stand and clicks the switch to see what happens.
-    belt.search_step()
-    belt.probe.poll()
+    sig.search_step()
+    sig.probe.poll()
 
     if frozen_reason then return end
 
@@ -2640,9 +3051,12 @@ local function tick_body()
         -- A livery change is as close as this branch gets to "the aeroplane may
         -- have changed": its datarefs go with it, so the hunt starts over.
         for _, c in ipairs(SEATBELT_CANDIDATES) do forget_dref(c.name) end
-        belt.bind(false)
-        belt.search_begin()
-        belt.probe.build()
+        sig.bind(false)
+        -- Every binding is aircraft-specific, not just the seat belt sign.
+        sig.icao = PLANE_ICAO or sig.icao
+        sig.bind_signals(false)
+        sig.search_begin()
+        sig.probe.build()
         resolve_airline()
         log("airline: %s (%s), pack %s", current_airline.code,
             current_airline.source, current_airline.pack)
@@ -2786,6 +3200,32 @@ local function draw_flight_tab()
     label_value("Seatbelt sign", seatbelt_dref and
         ((sim.seatbelt and "ON" or "off") .. "  " .. seatbelt_dref.name) or "not available",
         sim.seatbelt and COL.accent or COL.muted)
+
+    -- Every OTHER trigger, on one line each.  A missing trigger does not throw
+    -- and does not print: the phase simply never advances, nothing is due, and
+    -- the log comes out as clean as on a flight where everything worked.  The
+    -- only difference is a cabin that stays quiet - which from the outside looks
+    -- exactly like a broken script.  These lines tell the two apart.
+    for _, key in ipairs(sig.order) do
+        local b = sig.bound[key]
+        local text, colour
+        if not b then
+            text, colour = "борт не публикует", COL.warn
+        elseif key == "route_distance" then
+            local nm = sig.number(key)
+            text = (nm and nm > 0.1) and (fmt_num(nm) .. " nm  " .. b.name) or ("нет плана  " .. b.name)
+            colour = COL.muted
+        else
+            local value = sig.read(key)
+            if value == nil then
+                text, colour = "не знаю  " .. b.name, COL.warn
+            else
+                text = (value and "ON" or "off") .. "  " .. b.name
+                colour = value and COL.accent or COL.muted
+            end
+        end
+        label_value(sig.titles[key] or key, text, colour)
+    end
 
     imgui.Dummy(0, 6)
     imgui.Separator()
@@ -3196,8 +3636,8 @@ local function draw_settings_tab()
     if imgui.Button("Use##sb", 70, 20) then
         config_save()
         forget_dref(cfg.seatbelt_dref)
-        belt.bind(true)
-        belt.search_begin()
+        sig.bind(true)
+        sig.search_begin()
         log("seatbelt dataref: %s", seatbelt_dref and seatbelt_dref.name or "none")
     end
 
@@ -3483,10 +3923,13 @@ local LIBRARY_GUESSES = {
     with_slash(SYSTEM_DIRECTORY or "") .. "UA_Sounds",
 }
 
-belt.bind(true)
-belt.search_begin()
-belt.probe.build()
-logo_dref  = first_dref(LOGO_CANDIDATES)
+-- Which aeroplane, before the datarefs: signals.ini is keyed on it.
+sig.icao = PLANE_ICAO or ""
+sig.load_overrides()
+sig.bind(true)
+sig.bind_signals(true)
+sig.search_begin()
+sig.probe.build()
 clock_dref = first_dref(CLOCK_DREFS)
 
 scan_library()
