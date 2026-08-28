@@ -1456,7 +1456,12 @@ def scenario_widget(library):
         "widget = true\nwidget_mode = medium\n")
     run_script(lua)
 
-    # Parked and cold: the widget should say what boarding is waiting for.
+    # Parked and cold, seconds after loading: the widget should say what boarding
+    # is waiting for.  Nothing has been read yet at this point - the aeroplane's
+    # own datarefs are still being looked for - and an aeroplane that publishes
+    # nothing looks exactly like one whose plugin is a second behind.  So the
+    # cabin stays shut and the line says why, instead of naming four switches
+    # nobody has managed to look at yet.
     sim.set(on_ground=1, engines=0, beacon=0, gs_ms=0, battery=0,
             nav=0, taxi=0)
     advance(lua, sim, 3)
@@ -1464,18 +1469,30 @@ def scenario_widget(library):
     print("      " + "\n      ".join(lines))
     check(any(l.startswith("accent|PREFLIGHT") for l in lines),
           "the phase leads the widget")
+    check(lua.globals().XA_DEBUG.state().phase == "PREFLIGHT",
+          "the cabin stays shut while the datarefs are still being looked for")
     check(any("battery or any light on" in l for l in lines),
           "the missing condition is named")
-    # The condition is satisfied by any of four things, so it has to say which
-    # ones it is watching - "cabin power on" sent one user hunting for a cabin
-    # switch when what his ToLiss needed was the nav lights.
+    check(any("still looking for this aircraft's datarefs" in l for l in lines),
+          "and it says the search is what it waits for, not an invented 'no power'")
+
+    # Once a switch has been SEEN to move, the aeroplane is readable, and the
+    # line goes back to naming what it watches: the condition is satisfied by any
+    # of four things, and "cabin power on" sent one user hunting for a cabin
+    # switch when what his ToLiss needed was the nav lights.  Auto-boarding is
+    # held off by hand here, or the battery going on would open the cabin.
+    lua.execute("XA_DEBUG.config.auto_boarding = false")
+    sim.set(battery=1)
+    advance(lua, sim, 2)
+    sim.set(battery=0)
+    advance(lua, sim, 2)
+    lines = widget_text(lua)
     check(any("no battery/nav/taxi" in l for l in lines),
           "and it names what it is actually watching, not a vague 'cabin power'")
 
     # A study-level add-on may never drive X-Plane's generic battery dataref, so
     # nav lights alone have to be enough.  Held in Preflight first, to see the
     # line itself; then released, to see the phase actually move.
-    lua.execute("XA_DEBUG.config.auto_boarding = false")
     sim.set(nav=1)
     advance(lua, sim, 2)
     power_line = [l for l in widget_text(lua) if "battery or any light" in l]

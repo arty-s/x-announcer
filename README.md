@@ -272,8 +272,13 @@ So:
 1. **Three answers, not two.** A dataref the aeroplane published counts at once:
    if it published the name, it drives it. A stock dataref counts only once it
    has been seen lit or seen to move; until then the honest answer is "unknown".
-2. **Unknown forbids nothing.** If the aeroplane publishes none of the four
-   signs of electrical power, boarding starts anyway, and the window says why.
+2. **Unknown forbids nothing — but it is not waved through in a hurry.** If the
+   aeroplane publishes none of the four signs of electrical power, boarding
+   starts anyway, and the window says why. It waits for the two-minute search
+   for the aeroplane's own datarefs to give up first: straight after loading,
+   an aeroplane that publishes nothing and one whose plugin is a second behind
+   look exactly alike, and boarding a cold and dark cockpit is the worse
+   mistake of the two.
 3. **Every transition has a path through physics.** Lining up is strobes OR
    landing lights OR simply rolling faster than 40 knots; a departure starting
    is the beacon OR the engines running.

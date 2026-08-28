@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.2.1"
+local VERSION = "1.2.2"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -1670,6 +1670,14 @@ local function read_sim()
     s.battery       = sig.read("battery")
     s.logo          = sig.read("logo")
 
+    -- Not a fact about the aeroplane - a fact about how much of it we have had
+    -- time to learn.  sig.search_begin gives the aeroplane's own plugin two
+    -- minutes to register its datarefs, and until that search gives up every
+    -- signal above can read nil on an aeroplane that will publish all four a
+    -- second later.  Only one place cares, and it is the one place where nil is
+    -- waved through as "yes": see aircraft_powered.
+    s.signals_settled = sig.gave_up and true or false
+
     s.seatbelt = nil
     if seatbelt_dref then
         local ref = find_dref(seatbelt_dref.name)
@@ -2159,9 +2167,22 @@ local function state_machine()
 
     -- ---------------------------------------------------------------- ground
     if F.phase == "PREFLIGHT" then
-        local power = aircraft_powered(s)
+        local power, _, blind = aircraft_powered(s)
+        -- Blind means "none of the four exists here", and aircraft_powered says
+        -- yes to it on purpose - a question we cannot ask must not hold the
+        -- flight up.  But saying yes IMMEDIATELY is what made a cold and dark
+        -- aeroplane start boarding the second the script loaded: at that moment
+        -- nothing has been read yet, so every aeroplane looks blind, and a stock
+        -- dataref nobody has been seen to drive goes on looking blind until
+        -- somebody flips it.  The wave-through stays, it just waits until the
+        -- search has actually finished asking.  On an aeroplane that publishes
+        -- its switches a second late that is the whole difference; on one that
+        -- publishes nothing at all it costs the two minutes of the search and
+        -- then behaves as before - late is recoverable, a cabin that never opens
+        -- is not.
+        local may_wave_through = (not blind) or s.signals_settled
         if s.on_ground and s.all_engines_off and not s.beacon and s.gs_kt < 1 then
-            if cfg.auto_boarding and power then
+            if cfg.auto_boarding and power and may_wave_through then
                 set_phase("BOARDING")
                 once("BoardingStarted", "cabin ready")
             end
@@ -2450,7 +2471,13 @@ local function phase_conditions()
         -- difference between "flip the nav lights" and "the plugin is broken".
         local powered, on, blind = aircraft_powered(s)
         local reading
-        if blind then
+        if blind and not s.signals_settled then
+            -- Not "no power" - "not read yet".  The aeroplane's own datarefs are
+            -- still being looked for, and an unlit lamp with no reason beside it
+            -- reads as a broken plugin to somebody who has just powered the
+            -- cockpit up.
+            reading = "still looking for this aircraft's datarefs"
+        elseif blind then
             -- Met, but for a reason the person has to be told: this aeroplane
             -- publishes none of the four, so the condition is waved through
             -- rather than satisfied.  Without the note the panel would claim to
@@ -2473,7 +2500,11 @@ local function phase_conditions()
             yes("on the ground",   s.on_ground),
             yes("engines off",     s.all_engines_off),
             yes("beacon off",      not s.beacon),
-            yes("battery or any light on", powered, reading),
+            -- Exactly the machine's own test above, and it has to be: a
+            -- wave-through the machine has not granted yet must read as unmet
+            -- here, or the panel says the cabin is ready while it waits.
+            yes("battery or any light on",
+                powered and ((not blind) or s.signals_settled), reading),
         }
     elseif p == "BOARDING" then
         return "Doors & safety", {
