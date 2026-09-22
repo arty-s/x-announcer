@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.2.2"
+local VERSION = "1.2.3"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -484,12 +484,27 @@ local VOL_DREF = {
 
 local dref_cache = {}
 
+-- A name may carry the element it means: "AirbusFBW/BatOHPArray[1]".  The suffix
+-- is ours, not X-Plane's, so it comes off before every lookup - and it comes off
+-- HERE rather than at the one place that reads the number, because a name with a
+-- suffix travels through the binder, the cache and the retry loop first, and a
+-- name X-Plane has never heard of is dropped by the first of them.
+local function split_index(name)
+    -- Six digits is already a hundred times the longest array X-Plane
+    -- publishes; past that it is not an element but a typo, and the name is
+    -- left exactly as it was written.
+    local plain, index = string.match(name or "", "^(.-)%[(%d%d?%d?%d?%d?%d?)%]$")
+    if plain then return plain, tonumber(index) end
+    return name, nil
+end
+
 local function find_dref(name)
     if name == nil or name == "" then return nil end
-    local cached = dref_cache[name]
+    local plain = split_index(name)
+    local cached = dref_cache[plain]
     if cached == nil then
-        cached = XPLMFindDataRef(name) or false
-        dref_cache[name] = cached
+        cached = XPLMFindDataRef(plain) or false
+        dref_cache[plain] = cached
     end
     if cached == false then return nil end
     return cached
@@ -500,7 +515,7 @@ end
 -- true for the moment it was given, and an add-on that registers its datarefs a
 -- second after the aeroplane loads would stay missing for the whole flight.
 local function forget_dref(name)
-    if name and name ~= "" then dref_cache[name] = nil end
+    if name and name ~= "" then dref_cache[split_index(name)] = nil end
 end
 -- (kept a plain local: it is called from the boot code, before `sig` exists)
 
@@ -1085,6 +1100,7 @@ sig.own = {
         { name = "laminar/B738/toggle_switch/position_light_pos" },
         { name = "1-sim/ckpt/navLightSwitch/anim" },
         { name = "Rotate/aircraft/controls/nav_lts" },
+        { name = "ckpt/oh/navLight/anim" },                        -- ToLiss
     },
     -- The 777 wires these three the other way up - on(0), off(1) in its own
     -- switch table - so read the usual way round they would report the lights
@@ -1103,6 +1119,7 @@ sig.own = {
     taxi = {
         { name = "1-sim/ckpt/taxiLightSwitch/anim", on = 0, at_most = true },
         { name = "laminar/B738/toggle_switch/taxi_light_brightness_pos" },
+        { name = "ckpt/oh/taxiLight/anim" },                       -- ToLiss
     },
     -- X-Plane itself publishes no logo light; only add-ons do, which is why
     -- this one has no stock fallback at all.
@@ -1114,6 +1131,10 @@ sig.own = {
     },
     battery = {
         { name = "1-sim/ckpt/batteryButton/anim" },
+        -- ToLiss.  The push buttons themselves, published as a pair and read by
+        -- the aeroplane's own sound pack to play the battery relay - the switch
+        -- the Airbus actually watches, not a name near it.  Element 0 is BAT1.
+        { name = "AirbusFBW/BatOHPArray[0]" },
     },
     parkbrake = {
         { name = "1-sim/ckpt/parkbrake/anim" },
@@ -1136,7 +1157,10 @@ sig.stock_of = {
     strobe    = "sim/cockpit2/switches/strobe_lights_on",
     landing   = "sim/cockpit2/switches/landing_lights_on",
     taxi      = "sim/cockpit2/switches/taxi_light_on",
-    battery   = "sim/cockpit2/electrical/battery_on",
+    -- int[8], one per battery, and the element has to be named: read as a scalar
+    -- this answered zero on every aeroplane in the simulator, never moved, and
+    -- so counted as "this aeroplane publishes no battery" for ever.
+    battery   = "sim/cockpit2/electrical/battery_on[0]",
     parkbrake = "sim/flightmodel/controls/parkbrake",
 }
 
@@ -1171,6 +1195,8 @@ sig.sample = [[
 # Раздел - код борта из X-Plane (B738, B772, A20N) либо * для всех.
 # Строка - сигнал = датареф [on>=значение | on<=значение].
 # По умолчанию "включено" - это значение 1 и выше.
+# Если датареф - массив, элемент пишется в скобках:
+# battery = AirbusFBW/BatOHPArray[0]   (без скобок берётся нулевой)
 #
 # Сигналы: beacon, nav, strobe, landing, taxi, logo, battery,
 #          parkbrake, seatbelt, route_distance.
@@ -1185,15 +1211,44 @@ sig.sample = [[
 -- The number behind a binding, whichever way the aeroplane publishes it.  Some
 -- aircraft expose a switch position as a float and nothing else, and asking such
 -- a dataref for an int gives a confident zero.
+--
+-- So does asking an ARRAY for a scalar, and that one is worse, because plenty of
+-- the interesting datarefs are arrays: X-Plane publishes the battery switch as
+-- int[8], an Airbus publishes its battery push buttons as a pair.  Read as a
+-- scalar the battery answered zero on every aeroplane in the simulator and never
+-- moved, which a provisional stock binding reads as "this aeroplane publishes no
+-- battery at all" - and an aeroplane that publishes nothing is waved through as
+-- powered.  That is how a cold and dark cabin started boarding itself.
 function sig.raw(name)
+    local _, index = split_index(name)
     local ref = find_dref(name)
     if not ref then return nil end
+    if index ~= nil then return sig.element(ref, index) end
     local value = XPLMGetDatai(ref)
     if value == 0 then
         local as_float = XPLMGetDataf(ref)
-        if as_float then value = as_float end
+        if as_float and as_float ~= 0 then
+            value = as_float
+        else
+            -- Nothing so far, and an array gives exactly that through both of
+            -- them.  Element 0 is what a name without a suffix means.
+            local element = sig.element(ref, 0)
+            if element ~= nil then value = element end
+        end
     end
     return value
+end
+
+-- One element of an array dataref, int or float, or nil when it is neither.
+-- The vector accessors do not refuse a scalar dataref: they hand back nothing,
+-- which is how this tells the two apart without asking for the type.
+function sig.element(ref, index)
+    local ok, ints = pcall(XPLMGetDatavi, ref, index, 1)
+    if ok and ints and ints[0] ~= nil then return ints[0] end
+    local floats
+    ok, floats = pcall(XPLMGetDatavf, ref, index, 1)
+    if ok and floats and floats[0] ~= nil then return floats[0] end
+    return nil
 end
 
 function sig.lit(b, value)

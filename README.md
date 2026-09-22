@@ -309,7 +309,11 @@ taxi    = 1-sim/ckpt/taxiLightSwitch/anim on<=0
 ```
 
 The section is the aircraft code as X-Plane reports it, or `*` for all. The
-threshold is `on>=value` or `on<=value`, "1 and above" by default. Signals:
+threshold is `on>=value` or `on<=value`, "1 and above" by default. Where the
+dataref is an array, the element goes in brackets
+(`battery = AirbusFBW/BatOHPArray[0]`; element 0 without them): an array asked
+for a scalar does not fail, it answers zero, and such a signal looks switched
+off for ever. Signals:
 `beacon`, `nav`, `strobe`, `landing`, `taxi`, `logo`, `battery`, `parkbrake`,
 `seatbelt`, `route_distance`. The format is shared with the v2 branch, so a line
 carries over between them.
