@@ -33,7 +33,7 @@ if type(load_fmod_sound) ~= "function" then
     return
 end
 
-local VERSION = "1.2.3"
+local VERSION = "1.2.4"
 
 ----------------------------------------------------------------------------
 -- 0.  Small helpers
@@ -2131,6 +2131,13 @@ local function reset_flight(reason, start_phase)
         touchdown_fpm  = nil,
         touchdown_at   = nil,
         liftoff_at     = nil,
+        -- The bottom of the approach being flown, and how long the aeroplane has
+        -- been climbing away from it.  A go-around is the only move in this
+        -- machine that goes BACKWARDS, so it is also the only one that has to
+        -- know where it started: "climbing" is what a flare looks like too, and
+        -- the height gained since the lowest point is what tells them apart.
+        approach_low_ft = nil,
+        go_around_since = nil,
         turb_peak      = 0,
         -- The route measured once, at liftoff, from where the wheels left the
         -- ground to the last point of the plan.  Measuring it every tick would
@@ -2150,6 +2157,69 @@ local function set_phase(id)
     F.phase = id
     F.phase_since = sim_clock
     log("phase -> %s", id)
+end
+
+-- The only move this machine makes BACKWARDS.  Detection and rollback live in
+-- one function, and the thresholds are locals inside it, because the main chunk
+-- of this file sits at Lua's ceiling of 200 locals: three constants and a second
+-- function at the top level is what it takes to stop the whole script loading.
+-- In v2 the same three numbers are file-level constants.
+--
+-- Vertical speed alone is not enough to call a go-around: the flare shows a few
+-- hundred feet a minute upwards, a bounce shows more, and an approach flown down
+-- a step has moments of it all the way in.  The height actually gained is the
+-- other half of the question.  Both numbers come from Air Virtua's tracker,
+-- which reads the same events off the same simulators and arrived at them the
+-- expensive way - the 400 ft in particular, after an aeroplane levelling at a
+-- 1500 ft platform under vectors gave +900 fpm for five seconds and ninety feet
+-- of climb, and was called a go-around.
+--
+-- Everything the cabin says on the way down is a once() - exactly right for a
+-- flight with one approach, and exactly wrong for a flight with two.  Before
+-- this, a go-around left the machine sitting in APPROACH with every arrival call
+-- already marked as heard, and the second approach was flown in complete
+-- silence.  Nothing was missing from the log, because nothing was due.
+local function check_go_around(s)
+    local VS_FPM = 500
+    local HOLD_SEC = 3
+    local GAIN_FT = 400
+
+    -- How low this approach has been.  Kept per approach, not per flight: the
+    -- second one is measured from its own bottom, or a go-around off a
+    -- touch-and-go would still be compared against the first one's runway.
+    if F.approach_low_ft == nil or s.agl_ft < F.approach_low_ft then
+        F.approach_low_ft = s.agl_ft
+    end
+
+    local climbing_away = (not s.on_ground) and s.vs_fpm > VS_FPM
+        and (s.agl_ft - F.approach_low_ft) > GAIN_FT
+    if not climbing_away then
+        F.go_around_since = nil
+        return
+    end
+    F.go_around_since = F.go_around_since or sim_clock
+    if sim_clock - F.go_around_since < HOLD_SEC then return end
+
+    log("go-around: %d ft gained since the bottom of the approach",
+        round(s.agl_ft - F.approach_low_ft))
+    -- Re-armed are the calls that belong to AN approach, and only those.  The
+    -- descent PA and the night dimming belong to the arrival as a whole: they
+    -- were said once and have not become untrue.
+    for _, event in ipairs({ "BeforeLanding", "CrewSeatsLanding", "CallCabinSecureLanding" }) do
+        F.done[event] = nil
+        F.ended[event] = nil
+    end
+    -- A touch-and-go leaves a touchdown behind it, and the cabin's reaction to
+    -- one is due eight seconds later - by which time we are climbing away with
+    -- the gear coming up.  "What a smooth landing" over a go-around is worse
+    -- than silence.
+    F.touchdown_at = nil
+    F.touchdown_fpm = nil
+    F.approach_low_ft = nil
+    F.go_around_since = nil
+    -- Back to DESCENT rather than a phase of its own: what follows a go-around
+    -- is another approach, and DESCENT is the phase that knows how to start one.
+    set_phase("DESCENT")
 end
 
 -- play once per flight
@@ -2449,7 +2519,8 @@ local function state_machine()
     end
 
     if F.phase == "APPROACH" then
-        if s.on_ground and s.gs_kt < 60 then
+        check_go_around(s)
+        if F.phase == "APPROACH" and s.on_ground and s.gs_kt < 60 then
             once("AfterLanding", "vacated")
             set_phase("TAXI_IN")
         end

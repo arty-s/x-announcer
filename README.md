@@ -282,6 +282,13 @@ So:
 3. **Every transition has a path through physics.** Lining up is strobes OR
    landing lights OR simply rolling faster than 40 knots; a departure starting
    is the beacon OR the engines running.
+4. **One move goes backwards - the go-around.** The arrival calls are said once
+   per flight, but there can be two approaches. A sustained climb above 500 fpm
+   with 400 feet actually gained since the bottom of the approach returns the
+   phase to DESCENT and re-arms "prepare for landing", "cabin crew, take your
+   seats" and "cabin secure". Vertical speed alone will not do: the flare shows
+   it too, and so does a bounce. The touchdown reaction is dropped with it -
+   after a touch-and-go it would praise a landing that did not happen.
 
 The Flight tab now carries a line per signal under Seatbelt sign: what it reads
 and which dataref it reads it from. The same lines go to the log (`triggers:`)
