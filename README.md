@@ -1,3 +1,11 @@
+> **This branch is closed as of 24.09.2026.** Version 1 (the FlyWithLua script)
+> is no longer maintained. The final release is **1.2.5**.
+>
+> Development continues in version 2, a native plugin:
+> [github.com/arty-s/x-announcer2](https://github.com/arty-s/x-announcer2).
+> That one is Windows-only — if you need macOS or Linux, stay on 1.2.5: the code
+> here remains available, it simply no longer changes.
+
 # X-Announcer for X-Plane 12
 
 Cabin crew announcements for X-Plane 12. A FlyWithLua script that follows the

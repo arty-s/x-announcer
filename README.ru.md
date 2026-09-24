@@ -1,3 +1,11 @@
+> **Ветка закрыта 24.09.2026.** Версия 1 (скрипт для FlyWithLua) больше не
+> поддерживается и не развивается. Последний релиз — **1.2.5**.
+>
+> Развитие продолжается во второй версии, нативном плагине:
+> [github.com/arty-s/x-announcer2](https://github.com/arty-s/x-announcer2).
+> Она только под Windows — если вам нужны macOS или Linux, оставайтесь на 1.2.5:
+> код здесь остаётся доступным, он просто больше не меняется.
+
 # X-Announcer для X-Plane 12
 
 Аналог [MSFS Universal Announcer](https://github.com/fearlessfrog/MSFS_Universal_Announcer)
