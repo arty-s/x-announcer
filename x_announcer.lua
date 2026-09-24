@@ -1468,12 +1468,39 @@ local seatbelt_dref = nil
 -- Said once per hand-over, not every frame.
 local seatbelt_auto_logged = false
 
+-- Where the flap HANDLE is.  12.4.4 renamed it and prints "has been replaced.
+-- Please use the new name." on every lookup of the old spelling.  The new name
+-- is asked for FIRST and the old one is only touched when the new one is absent
+-- - that is 12.0-12.3, where the old name is the only one there is and nothing
+-- is printed.  The order matters in both directions: on 12.4.4 the old spelling
+-- still RESOLVES, so asking for it first would print the warning and also mean
+-- the new name is never reached, the trap where a candidate that always answers
+-- silently ends the list.
+--
+-- Not flap_system_deploy_ratio: that is where the surfaces actually are, and a
+-- switch left in AUTO follows what the crew commanded, not what the flaps have
+-- reached.  Kept on `sig` rather than in a local: the main chunk of this file
+-- sits at the 200-local ceiling, and one more would stop it compiling.
+sig.flap_name_cached = nil
+
+function sig.flap_name()
+    if sig.flap_name_cached == nil then
+        if find_dref("sim/cockpit2/controls/flap_handle_request_ratio") then
+            sig.flap_name_cached = "sim/cockpit2/controls/flap_handle_request_ratio"
+        else
+            sig.flap_name_cached = "sim/cockpit2/controls/flap_ratio"
+        end
+        log("datarefs: положение закрылков читаю из %s", sig.flap_name_cached)
+    end
+    return sig.flap_name_cached
+end
+
 -- What the aeroplane does with a switch left in AUTO.  Taken from the 737's own
 -- cabin logic rather than invented: the sign is lit with flaps out or the gear
 -- down - departure and arrival - and deployed masks override the lot.
 function sig.auto_lit()
     if geti("sim/operation/failures/rel_pass_o2_on", 0) == 6 then return true end
-    if getf("sim/cockpit2/controls/flap_ratio", 0) > 0.01 then return true end
+    if getf(sig.flap_name(), 0) > 0.01 then return true end
     return geti("sim/cockpit2/controls/gear_handle_down", 0) == 1
 end
 
@@ -1768,7 +1795,8 @@ local function read_sim()
                     if not seatbelt_auto_logged then
                         seatbelt_auto_logged = true
                         log("seatbelt switch is in AUTO - самолёт решает сам, беру табло по "
-                            .. "закрылкам и шасси (%s тут не загорается)", SEATBELT_ANNUNCIATOR)
+                            .. "закрылкам и шасси (%s тут не загорается, закрылки из %s)",
+                            SEATBELT_ANNUNCIATOR, sig.flap_name())
                     end
                 end
             else
